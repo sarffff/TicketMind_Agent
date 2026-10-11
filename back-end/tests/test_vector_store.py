@@ -4,9 +4,12 @@
 
 真正值得测的是三处会静默出错的地方：
 
-1. **降级。** 配了 qdrant 但连不上时必须退回 memory 并且**只报警告一次**，不能
-   500、也不能每次检索刷一条日志。降级本身是无声的，所以 ``uses_qdrant()``
-   必须说真话——``retriever`` 靠它决定还要不要从 MySQL 拉 embedding 大字段。
+1. **降级。** 配了 qdrant 但连不上时必须退回 memory，不能 500；冷却窗口内不敲第二次
+   门（宕一小时刷爆日志算什么呢），但**窗口到了要再试一次**——降级不是终态，一次瞬时
+   连不上不该把这个进程永久钉在内存索引上。降级本身是无声的，所以 ``uses_qdrant()``
+   必须说真话（``retriever`` 靠它决定还要不要从 MySQL 拉 embedding 大字段），而
+   ``degradation_state()`` 得报出"期间空转了几条 upsert"——那些 chunk 没进 Qdrant，
+   恢复之后会开始被检索漏掉，除了这个数没有任何地方说得出来。
 2. **workspace 过滤。** 单 collection 存所有工作区，filter 漏了就是跨工作区串数据。
 3. **删除。** MySQL 那边有 ON DELETE CASCADE，Qdrant 没有外键。漏删的后果是删掉的
    文档还能被召回，而 ``retriever`` 的 ``if chunk_id in by_id`` 会静默丢掉它——
@@ -105,6 +108,103 @@ def test_unknown_backend_name_falls_back_to_memory():
     vs.reset_for_tests()
 
     assert vs.get_store() is vs._memory_store
+
+
+# ========== 降级不是终态 ==========
+
+
+class _Clock:
+    """替掉 ``vs.time``：降级窗口是按 monotonic 算的，测试不能真等 60 秒。
+
+    换整个模块属性而不是 ``monkeypatch.setattr(time, "monotonic", ...)``——后者会
+    改到进程级的 time，同一轮里别的东西（超时、退避）就跟着一起被冻住了。
+    """
+
+    def __init__(self, start: float = 1000.0):
+        self.now = start
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _refusing(monkeypatch, counter: dict):
+    def _boom(self):
+        counter["count"] = counter.get("count", 0) + 1
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(vs.QdrantVectorStore, "_get_client", _boom)
+
+
+def test_degradation_retries_after_the_window(monkeypatch):
+    """一次瞬时连不上不该把这个进程永久钉在内存索引上。
+
+    踩过的形状：``_degraded`` 是单向门，只有测试用的 ``reset_for_tests()`` 会清。
+    Qdrant 重启十秒 → 本进程整个生命周期都用内存索引，而"多 worker 共享、重启不丢"
+    这些搬过去的理由一个都不成立了，症状还不报错。
+    """
+    settings.VECTOR_STORE = "qdrant"
+    vs.reset_for_tests()
+    clock = _Clock()
+    monkeypatch.setattr(vs, "time", clock)
+    calls: dict = {}
+    _refusing(monkeypatch, calls)
+
+    assert vs.get_store() is vs._memory_store
+    assert vs.degradation_state() is not None
+    assert calls == {"count": 1}
+
+    # 冷却窗口内不敲第二次门（否则 Qdrant 宕一小时 = 刷爆日志）
+    for _ in range(20):
+        vs.get_store()
+    assert calls == {"count": 1}
+
+    # 到点再试一次；这次连上了就该切回去
+    monkeypatch.setattr(vs.QdrantVectorStore, "_get_client", lambda self: object())
+    clock.advance(vs._QDRANT_RETRY_SECONDS + 1)
+    assert vs.get_store() is not vs._memory_store
+    assert vs.uses_qdrant() is True
+    assert vs.degradation_state() is None, "恢复之后不该还报着降级"
+
+
+def test_writes_dropped_while_degraded_are_counted(monkeypatch):
+    """降级期间的 upsert 是空转的，那些 chunk 永远进不了 Qdrant。
+
+    恢复之后 ``uses_qdrant()`` 回到 True，retriever 就不再从 MySQL 拉 embedding
+    重建了——于是这几条开始被检索漏掉，而没有任何一条日志说过"少了东西"。
+    计数是这件事唯一的出口。
+    """
+    import asyncio
+
+    settings.VECTOR_STORE = "qdrant"
+    vs.reset_for_tests()
+    clock = _Clock()
+    monkeypatch.setattr(vs, "time", clock)
+    _refusing(monkeypatch, {})
+    assert vs.get_store() is vs._memory_store
+
+    records = [vs.VectorRecord(chunk_id=f"c{i}", document_id="d1", vector=[0.1]) for i in range(3)]
+    asyncio.run(vs._memory_store.upsert("ws-1", records))
+
+    state = vs.degradation_state()
+    assert state["writesDropped"] == 3
+
+    # 恢复时这个数会被报进日志再清零——留着不清就是"每次恢复都报一遍陈年旧账"
+    monkeypatch.setattr(vs.QdrantVectorStore, "_get_client", lambda self: object())
+    clock.advance(vs._QDRANT_RETRY_SECONDS + 1)
+    vs.get_store()
+    assert vs.degradation_state() is None
+
+
+def test_memory_backend_never_reports_degradation():
+    """没配 Qdrant 就不是降级，是正常状态。把两者混起来会让健康检查天天红。"""
+    settings.VECTOR_STORE = "memory"
+    vs.reset_for_tests()
+
+    assert vs.get_store() is vs._memory_store
+    assert vs.degradation_state() is None
 
 
 # ========== Qdrant：过滤与写入 ==========

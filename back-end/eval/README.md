@@ -1,18 +1,25 @@
 # 离线评估
 
-现在有两个评估面，各自回答一个问题：
+现在有三个评估面，各自回答一个问题：
 
 | 面 | 回答的问题 | 是否花钱 |
 | --- | --- | --- |
 | `eval/ticket_guardrail.py` | **工单处置的护栏漏没漏**：该挂审的挂了吗、退款重复/超额了吗、幂等破了吗 | 不花钱（脚本化替身，只看落库事实） |
+| `eval/ticket_behavior.py` | **模型会不会提出不该提的操作**：提了越界的写操作吗、提案金额超过可退余额吗、回复里承诺了台账没有的动作吗 | 花钱（真实模型；`--judge` 再多次调用） |
 | `eval/run.py` | 改了检索配置，政策库的召回**变好了还是变坏了** | 花钱（真实调用模型与 embedding） |
 
-CI 里应当跑前者：`python -m eval.ticket_guardrail --fail-on-breach`，它没有网络依赖，
-漏一次审批就非零退出。后者按窗口手工跑。
+CI 里应当跑第一个：`python -m eval.ticket_guardrail --fail-on-breach`，它没有网络依赖，
+漏一次审批就非零退出。后两个按窗口手工跑——它们每次结论都可能随模型与温度变，
+所以给趋势不给门禁。
 
 ```bash
 cd back-end
 python -m eval.ticket_guardrail --fail-on-breach    # 工单护栏门禁（离线、零成本）
+
+python -m eval.ticket_behavior --limit 3            # 行为评估小样本（真调模型）
+python -m eval.ticket_behavior                      # 全量 12 条
+python -m eval.ticket_behavior --judge              # 再加一次裁判调用评"做得对不对"
+python -m eval.ticket_behavior --json               # 机器可读
 
 python -m eval.run --limit 5                        # 小样本试跑，先确认链路通
 python -m eval.run                                  # baseline 跑全量
@@ -22,16 +29,18 @@ python -m eval.run --variants all                   # 全部变体对照
 
 RAG 报告写到 `eval/reports/`：`.md` 是对照表，`.json` 是逐题明细（含裁判理由与完整回答）。
 
-`eval.run` 会真实调用模型与 embedding 接口，**产生费用**。开销约为
-`问题数 × 变体数 × (1 次生成 + 1 次裁判)`，加上检索本身的 embedding 调用。
-先用 `--limit` 估算。
+`eval.run` 与 `eval.ticket_behavior` 会真实调用模型与 embedding 接口，**产生费用**。
+RAG 那侧开销约为 `问题数 × 变体数 × (1 次生成 + 1 次裁判)`，加上检索本身的 embedding
+调用；行为评估那侧约为 `工单数 × (3~8 次调用)`（理解 + 规划 + 推理循环，`--judge` 再
++1）。先用 `--limit` 估算。
 
 > 本文后半部分有一整篇讲的是**对话工作台的 Agent 评估**（`run_agent.py` /
 > `agent_runner.py` / `datasets/agent_tasks.jsonl`）。那套模块已随通用对话能力一起
 > 删除，章节保留是为了让"当初为什么这么测、测出了什么"这件事有据可查——
-> 里面的命令现在跑不起来。工单侧的等价物是 `ticket_guardrail.py`（确定性那一半，
-> 含一条"把退款塞进委派去绕过人审"的案例）；"模型会不会提出不该提的操作"那一半
-> 需要真实模型与裁判，工单版还没有实现。
+> 里面的命令现在跑不起来。工单侧的等价物是两个面：`ticket_guardrail.py` 量
+> "提出了会不会让它发生"（确定性那一半，含一条"把退款塞进委派去绕过人审"的案例），
+> `ticket_behavior.py` 量"模型会不会提出不该提的"（真实模型那一半）。两者共用同一份
+> 数据集和同一张工单图，换的只有模型通道。
 
 ## 组成
 
@@ -47,8 +56,9 @@ RAG 报告写到 `eval/reports/`：`.md` 是对照表，`.json` 是逐题明细�
 | `run.py` | RAG 评估 CLI 与报告渲染 |
 | `gate.py` + `gate_thresholds.json` | 阈值化的回归判定，区分"模型变差"与"测量坏了" |
 | `calibration.py` | 裁判一致性：同一批答案换裁判会不会给出不同结论 |
-| `datasets/ticket_guardrails.jsonl` | 12 张工单：该挂审的、该挡的、该幂等的、该拒答的，以及一条"把退款塞进委派去绕过人审" |
+| `datasets/ticket_guardrails.jsonl` | 12 张工单：该挂审的、该挡的、该幂等的、该拒答的，以及一条"把退款塞进委派去绕过人审"。每条同时带 `expect`（护栏那半的落库期望）和 `behavior`（行为那半的提案期望 + rubric），两个面各取各的字段 |
 | `ticket_guardrail.py` | 工单处置的护栏评估：在通道边界打桩，判据只取落库事实；案例可用 `settings` 字段临时打开配置（委派那一半只有打开才存在，跑完原样还回去） |
+| `ticket_behavior.py` | 工单行为评估：同一套夹具换成真实模型，量"模型会不会提不该提的"。提案越界、退款金额超可退余额、回复承诺台账里没有的动作——前两条读案例的 `behavior` 块，第三条对所有案例生效 |
 | `../prompts/eval_rag_answer/` | 回答提示词的各个版本（提示词也是被扫的维度之一） |
 
 语料是自造的，不含任何真实数据，因此可以提交进仓库、结果可复现。

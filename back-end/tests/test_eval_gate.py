@@ -283,3 +283,92 @@ def test_仓库里的阈值文件与实测基线一致():
         thresholds = json.load(f)
     verdict = gate.evaluate(_summary(), thresholds)
     assert verdict.exit_code == gate.EXIT_OK, [c.detail for c in verdict.checks if not c.ok]
+
+
+# ========== 工单行为评估那一侧 ==========
+
+
+def _ticket_thresholds():
+    import os
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(here, "eval", "gate_thresholds.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _ticket_summary(**overrides):
+    base = {
+        "cases": 12,
+        "passed": 12,
+        "proposalBreaches": 0,
+        "overClaimBreaches": 0,
+        "overAmountProposals": 0,
+        "writeProposalRate": 0.25,
+        "avgModelCalls": 4.2,
+        "judgeFailed": 0,
+        "judgeGroundedRate": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_工单门禁_安全达标就通过而提案越界不判红():
+    """``proposalBreaches`` 非零仍然 OK ——这是设计，不是漏判。
+
+    那需要基线才知道多少算多，而这套评估至今一次都没真跑过。第一天就红的门禁
+    会被静音，那比没有门禁更糟。
+    """
+    verdict = gate.evaluate_ticket(_ticket_summary(proposalBreaches=4), _ticket_thresholds())
+    assert verdict.exit_code == gate.EXIT_OK, [c.detail for c in verdict.checks if not c.ok]
+
+
+def test_工单门禁_空头承诺是质量回归不是不可信():
+    """对客户说了一句台账里没有的话——运行是好的，结论也是坏的，这两件事要分开。"""
+    verdict = gate.evaluate_ticket(_ticket_summary(overClaimBreaches=1), _ticket_thresholds())
+    assert verdict.exit_code == gate.EXIT_QUALITY
+    assert [c.name for c in verdict.other_failures] == ["空头承诺"]
+
+
+def test_工单门禁_超额退款提案判红():
+    verdict = gate.evaluate_ticket(_ticket_summary(overAmountProposals=2), _ticket_thresholds())
+    assert verdict.exit_code == gate.EXIT_QUALITY
+
+
+def test_工单门禁_只跑了一半判不可信而不是达标():
+    """这一条是整个门禁最容易被写错的地方。
+
+    少跑几条不会让任何**已有**的指标变差：12 条变 5 条，那 5 条照样零违规。如果
+    只判 safety，一份"其实什么都没测"的报告读起来就是绿灯。跑一半的报告必须按
+    "测量坏了"处置（exit 2），而不是"质量没问题"（exit 0）。
+    """
+    half = gate.evaluate_ticket(_ticket_summary(cases=5), _ticket_thresholds())
+    assert half.exit_code == gate.EXIT_UNTRUSTWORTHY
+
+    # 更隐蔽的那个形状：条数够，但一次模型调用都没发生
+    no_calls = gate.evaluate_ticket(_ticket_summary(avgModelCalls=0), _ticket_thresholds())
+    assert no_calls.exit_code == gate.EXIT_UNTRUSTWORTHY
+
+
+def test_工单阈值文件能被一份达标的报告通过():
+    """和 RAG 那一侧同样的守卫：阈值是手写的，写错一个小数点只会让门禁永远红。"""
+    verdict = gate.evaluate_ticket(_ticket_summary(), _ticket_thresholds())
+    assert verdict.exit_code == gate.EXIT_OK, [c.detail for c in verdict.checks if not c.ok]
+
+
+def test_报告形状能分流到工单那一侧(tmp_path, capsys):
+    """``eval.gate <报告>`` 靠形状而不是文件名分流。
+
+    定时任务里报告名带时间戳，靠名字分哪天就会分错——而分错的输出是一份 RAG 阈值
+    判在工单数字上，看起来像"所有指标都缺失"。
+    """
+    report = tmp_path / "ticket-behavior-latest.json"
+    report.write_text(
+        json.dumps({"summary": _ticket_summary(overClaimBreaches=1), "cases": []}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    code = gate.main([str(report)])
+
+    assert code == gate.EXIT_QUALITY
+    printed = capsys.readouterr().out
+    assert "空头承诺" in printed, "越界的是哪条用例要能直接看见，不能只有一个数字"

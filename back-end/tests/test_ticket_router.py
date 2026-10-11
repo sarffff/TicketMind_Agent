@@ -803,3 +803,286 @@ def test_抑制一条待发的回复要理由并留下轨迹(client, db_session,
     assert ok.status_code == 200 and ok.json()["status"] == "suppressed"
     events = client.get(f"/tickets/{ticket_id}/events", headers=headers).json()["events"]
     assert any("被抑制" in (event["message"] or "") for event in events)
+
+
+# ========== 客户偏好：只有坐席能写 ==========
+
+
+def _ticket_with_customer(client, headers, email):
+    return client.post(
+        "/tickets",
+        json={"content": "ORD-9 没发货，帮我看看到哪了", "customer_email": email},
+        headers=headers,
+    ).json()["ticketId"]
+
+
+def test_坐席记的偏好进画像并去掉首尾空白(client, db_session):
+    from models import CsCustomer
+    from services.ticket import history as ticket_history
+
+    headers = _headers(client)
+    ticket_id = _ticket_with_customer(client, headers, "li@corp.com")
+
+    created = client.post(
+        f"/tickets/{ticket_id}/preference",
+        json={"preference": "  不要打电话，发邮件  "},
+        headers=headers,
+    ).json()
+    assert created["preferences"] == ["不要打电话，发邮件"]
+
+    detail = client.get(f"/tickets/{ticket_id}", headers=headers).json()["ticket"]
+    customer = db_session.query(CsCustomer).filter_by(id=detail["customerId"]).one()
+    assert ticket_history.read_profile(customer)["preferences"] == ["不要打电话，发邮件"]
+
+
+def test_详情接口把画像摆给坐席看(client):
+    """看不见就等于不信。坐席要能读到"模型下次会读到什么"，而不是只能选择相信。"""
+    headers = _headers(client)
+    ticket_id = _ticket_with_customer(client, headers, "kan@corp.com")
+    assert client.get(f"/tickets/{ticket_id}", headers=headers).json()[
+        "customerPreferences"
+    ] == []
+
+    client.post(
+        f"/tickets/{ticket_id}/preference",
+        json={"preference": "只在工作时间联系"},
+        headers=headers,
+    )
+    body = client.get(f"/tickets/{ticket_id}", headers=headers).json()
+    assert body["customerPreferences"] == ["只在工作时间联系"]
+    # 画像属于客户不属于工单，所以它摆在 ticket 之外而不是塞进工单对象里
+    assert "customerPreferences" not in body["ticket"]
+
+
+def test_同一条偏好不会被记两次(client):
+    """画像会喂给之后每一单的模型，重复三遍"发邮件"就是把三行预算花在废话上。"""
+    headers = _headers(client)
+    ticket_id = _ticket_with_customer(client, headers, "wu@corp.com")
+
+    for _ in range(3):
+        body = client.post(
+            f"/tickets/{ticket_id}/preference",
+            json={"preference": "工作日晚上别联系"},
+            headers=headers,
+        ).json()
+    assert body["preferences"] == ["工作日晚上别联系"]
+
+
+def test_记了却读不到等于没记(client, db_session, monkeypatch):
+    """钉整条闭环：坐席写 → 画像 → 下一张工单喂给模型的那段摘要。
+
+    写侧和读侧各自都有单测，但它们中间断过一次也没人发现——画像函数改了渲染措辞，
+    断言"画像里有这条"照样通过，而模型其实一个字都没多看到。
+    """
+    from routers import ticket_router
+    from conftest import ScriptedAdapter
+
+    headers = _headers(client)
+    first = _ticket_with_customer(client, headers, "zhao@corp.com")
+    client.post(
+        f"/tickets/{first}/preference",
+        json={"preference": "不要打电话，发邮件"},
+        headers=headers,
+    )
+
+    seen = {}
+
+    def _make():
+        adapter = ScriptedAdapter(
+            [
+                {
+                    "text": json.dumps(
+                        {
+                            "intent": "query_logistics",
+                            "product": "",
+                            "sentiment": "calm",
+                            "order_nos": ["ORD-9"],
+                            "amount": "",
+                            "summary": "查发货",
+                        }
+                    )
+                },
+                {"text": "[]"},
+                {"text": "查到了吗——先看一眼画像。"},
+            ]
+        )
+        seen["adapter"] = adapter
+        return adapter
+
+    monkeypatch.setattr(ticket_router, "_make_adapter", _make)
+    second = _ticket_with_customer(client, headers, "zhao@corp.com")
+    assert client.post(f"/tickets/{second}/run", headers=headers).status_code == 200
+
+    fed = " ".join(
+        str(message.get("content") or "")
+        for call in seen["adapter"].calls
+        for message in call["messages"]
+    )
+    assert "不要打电话，发邮件" in fed, "画像没进到模型的上下文里"
+
+
+def test_没有关联客户的工单记不了偏好(client):
+    """宁可报错也不"顺手建一个客户"：把偏好写到错的人身上比不写更难纠正。"""
+    headers = _headers(client)
+    anonymous = client.post(
+        "/tickets", json={"content": "查物流"}, headers=headers
+    ).json()["ticketId"]
+
+    refused = client.post(
+        f"/tickets/{anonymous}/preference",
+        json={"preference": "发邮件别打电话"},
+        headers=headers,
+    )
+    assert refused.status_code == 409
+
+
+def test_别人的工单不能替他记偏好(client, db_session):
+    from models import Ticket, User
+
+    headers = _headers(client)
+    ticket_id = _ticket_with_customer(client, headers, "sun@corp.com")
+    other = _headers(client, email="bob@example.com", username="bob")
+    bob = db_session.query(User).filter_by(email="bob@example.com").first()
+    alice = db_session.query(User).filter_by(email="alice@example.com").first()
+    bob.workspace_id = alice.workspace_id
+    bob.role = "user"
+    ticket = db_session.query(Ticket).filter_by(id=ticket_id).one()
+    ticket.assignee_id = alice.id
+    db_session.commit()
+
+    refused = client.post(
+        f"/tickets/{ticket_id}/preference",
+        json={"preference": "只接受短信"},
+        headers=other,
+    )
+    assert refused.status_code == 403
+    assert client.get(f"/tickets/{ticket_id}", headers=headers).json()["ticket"] is not None
+
+
+def test_空白偏好不会被当成一条记录(client):
+    headers = _headers(client)
+    ticket_id = _ticket_with_customer(client, headers, "qian@corp.com")
+
+    too_long = client.post(
+        f"/tickets/{ticket_id}/preference", json={"preference": "哈" * 201}, headers=headers
+    )
+    assert too_long.status_code == 422
+    blank = client.post(
+        f"/tickets/{ticket_id}/preference", json={"preference": "   "}, headers=headers
+    )
+    assert blank.status_code == 400
+    assert client.get(f"/tickets/{ticket_id}", headers=headers).json()["ticket"] is not None
+
+
+# ========== 业务数据导入 ==========
+
+_IMPORT_BODY = {
+    "customers": [{"email": "buyer@example.com", "phone": "+86 138-0000-0000"}],
+    "orders": [
+        {
+            "order_no": "ORD-7001",
+            "status": "paid",
+            "total_amount": "350.00",
+            "customer": {"email": "buyer@example.com"},
+            "items": [{"sku": "SKU-1", "title": "蓝牙耳机", "quantity": 2, "unit_price": "175.00"}],
+        }
+    ],
+}
+
+
+def test_管理员导入之后工单查得到这张单(client, db_session):
+    headers = _headers(client)
+    response = client.post("/tickets/cs/import", json=_IMPORT_BODY, headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["applied"] is True
+    assert body["ordersCreated"] == 1 and body["customersCreated"] == 1
+
+    user = _current_user(client, db_session)
+    from services.ticket import business_system
+
+    snapshot = business_system.for_session(db_session, user.workspace_id).get_order("ORD-7001")
+    assert snapshot is not None, "接口说写进去了，读侧接缝却查不到"
+    assert str(snapshot.total_amount) == "350.00"
+    assert [line.sku for line in snapshot.lines] == ["SKU-1"]
+
+
+def test_普通坐席导不动(client, db_session):
+    from models import CsOrder
+
+    headers = _headers(client)
+    user = _current_user(client, db_session)
+    user.role = "user"  # 注册出来的第一个用户默认 admin
+    db_session.commit()
+
+    denied = client.post("/tickets/cs/import", json=_IMPORT_BODY, headers=headers)
+    assert denied.status_code == 403
+    assert db_session.query(CsOrder).count() == 0, "被拒的那次不该留下半个客户"
+
+
+def test_域开关关掉时仍然导得进来(client, monkeypatch):
+    """这条是**有意的**：那个开关管的是"要不要让模型办工单"，而导数据是打开之前
+    就要做的事。一起拦掉的话，第一次部署得"开→导→409→关→再开"，那条顺序没人会走，
+    于是这个端点在真实部署里从来没被调过。"""
+    monkeypatch.setattr(settings, "TICKET_AGENT_ENABLED", False)
+    headers = _headers(client)
+    response = client.post("/tickets/cs/import", json=_IMPORT_BODY, headers=headers)
+    assert response.status_code == 200, response.text
+
+
+def test_校验不过把每一行的原因都报回去(client, db_session):
+    from models import CsOrder
+
+    headers = _headers(client)
+    bad = {
+        "orders": [
+            {"order_no": "A", "total_amount": "10"},
+            {"order_no": "B", "total_amount": "-4"},
+            {"order_no": "C", "total_amount": "9", "status": "shiped"},
+        ]
+    }
+    response = client.post("/tickets/cs/import", json=bad, headers=headers)
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert {row["ref"] for row in detail} == {"orders[1]", "orders[2]"}
+    assert db_session.query(CsOrder).count() == 0, "整批一行都没该落"
+
+
+def test_导入进的是自己的租户(client, db_session):
+    from models import CsOrder
+
+    headers = _headers(client)
+    user = _current_user(client, db_session)
+    client.post("/tickets/cs/import", json=_IMPORT_BODY, headers=headers)
+
+    row = db_session.query(CsOrder).filter_by(order_no="ORD-7001").one()
+    assert row.workspace_id == user.workspace_id
+
+
+def test_载荷冒充别人的租户被拒(client, db_session):
+    headers = _headers(client)
+    body = {
+        "orders": [
+            {"order_no": "H", "total_amount": "1", "workspace_id": "另一个工作区"}
+        ]
+    }
+    response = client.post("/tickets/cs/import", json=body, headers=headers)
+    assert response.status_code == 422
+    assert "workspace_id" in response.json()["detail"][0]["reason"]
+
+
+def test_导入留下审计但不带客户隐私(client, db_session):
+    from services import audit_log
+
+    headers = _headers(client)
+    user = _current_user(client, db_session)
+    client.post("/tickets/cs/import", json=_IMPORT_BODY, headers=headers)
+
+    entries = audit_log.history(db_session, user.id)
+    mine = [e for e in entries if e["action"] == "cs.import"]
+    assert mine, "谁导了这批数据必须能被翻出来"
+    dumped = json.dumps(mine[0], ensure_ascii=False)
+    assert "buyer@example.com" not in dumped, "审计里存的是计数，不是客户邮箱和地址"
+    assert "ORD-7001" not in dumped
+
+

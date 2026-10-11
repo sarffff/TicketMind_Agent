@@ -25,8 +25,9 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from config import settings
 from services.retrieval_index import VectorIndex, get_scope_indexes
@@ -62,9 +63,15 @@ class MemoryVectorStore:
     ``upsert`` / ``delete_document`` 都是空操作：这个后端的索引是从 MySQL 派生的，
     由 ``retriever`` 在检索时按签名重建。保留这两个方法只是为了让两个后端满足
     同一个协议——调用方因此不需要 ``if settings.VECTOR_STORE == ...``。
+
+    唯一例外是"配置要用 Qdrant 但当前降级到这儿"：那时 upsert 空转意味着那些
+    chunk 永远进不了 Qdrant，恢复之后检索会开始漏它们（``uses_qdrant()`` 变回
+    True 就不再从 MySQL 拉 embedding 重建了）。所以这里要数一下空转了多少条，
+    好在恢复时明确告诉运维"这些得回填"。
     """
 
     async def upsert(self, scope_id: str, records: list[VectorRecord]) -> None:
+        note_write_dropped(len(records))
         return None
 
     async def delete_document(self, scope_id: str, document_id: str) -> None:
@@ -257,31 +264,107 @@ class QdrantVectorStore:
 
 _memory_store = MemoryVectorStore()
 _qdrant_store: QdrantVectorStore | None = None
-# 一次性降级标记：Qdrant 连不上时打一条警告就退回 memory，而不是每次检索都打。
-# 降级而不是 500 的理由和"web_search 没配就不注册工具""faiss 缺失就走 numpy"
-# 是同一套：一个可选的外部依赖不该让整个问答功能不可用。
-_degraded = False
+
+# 降级是**暂时的**，不是终态。
+#
+# 退到内存索引这个决定本身站得住：一个可选的外部依赖不该让整个问答功能不可用
+# （和"web_search 没配就不注册工具""faiss 缺失就走 numpy"同一套）。但原来那一版
+# 把标记设成一次性的 ``_degraded = True``，只有测试用的 ``reset_for_tests()`` 会清
+# ——于是 Qdrant 重启十秒，这个进程就永久停在内存索引直到自己也被重启，而"多 worker
+# 共享一份、重启不丢"这些搬过来的理由一个都不成立了。症状还不报错：检索照样有结果。
+#
+# 所以这里改成带窗口的降级：过一段时间再试一次。恢复时明确报出降级期间空转了多少条
+# upsert——那些 chunk 没进 Qdrant，恢复之后检索会开始漏它们（``uses_qdrant()`` 一旦
+# 回到 True，retriever 就不再从 MySQL 拉 embedding 重建了），得回填。
+_QDRANT_RETRY_SECONDS = 60.0
+
+# time.monotonic() 的到期时刻；0 表示当前没有降级
+_retry_after = 0.0
+_degraded_reason: str | None = None
+_degraded_episodes = 0
+_writes_dropped_while_degraded = 0
+
+
+def note_write_dropped(count: int) -> None:
+    """记一笔"这次 upsert 因为降级而空转了"。没在降级时什么都不做。"""
+    global _writes_dropped_while_degraded
+    if _degraded_reason is not None:
+        _writes_dropped_while_degraded += max(0, int(count))
 
 
 def get_store() -> VectorStore:
-    """按配置返回后端。Qdrant 不可用时退回进程内索引。"""
-    global _qdrant_store, _degraded
+    """按配置返回后端。Qdrant 连不上就退回进程内索引，并安排稍后重试。"""
+    global _qdrant_store, _retry_after, _degraded_reason, _degraded_episodes
+    global _writes_dropped_while_degraded
 
-    if (settings.VECTOR_STORE or "").strip().lower() != "qdrant" or _degraded:
+    if (settings.VECTOR_STORE or "").strip().lower() != "qdrant":
         return _memory_store
-    if _qdrant_store is None:
-        try:
-            _qdrant_store = QdrantVectorStore()
-            _qdrant_store._get_client()
-        except Exception as exc:
-            _degraded = True
+    if _qdrant_store is not None:
+        return _qdrant_store
+
+    now = time.monotonic()
+    if _degraded_reason is not None and now < _retry_after:
+        return _memory_store
+
+    try:
+        store = QdrantVectorStore()
+        store._get_client()
+    except Exception as exc:
+        _degraded_reason = f"{type(exc).__name__}: {exc}"[:200]
+        _degraded_episodes += 1
+        _retry_after = now + _QDRANT_RETRY_SECONDS
+        _qdrant_store = None
+        if _degraded_episodes == 1:
             logger.error(
                 "VECTOR_STORE=qdrant but the client could not be created (%s); "
-                "falling back to the in-process index",
-                type(exc).__name__,
+                "falling back to the in-process index, retrying every %ss",
+                _degraded_reason,
+                _QDRANT_RETRY_SECONDS,
             )
-            return _memory_store
-    return _qdrant_store
+        else:
+            logger.warning(
+                "Qdrant still unreachable (attempt %d): %s",
+                _degraded_episodes,
+                _degraded_reason,
+            )
+        return _memory_store
+
+    if _degraded_reason is not None:
+        dropped = _writes_dropped_while_degraded
+        logger.info(
+            "Qdrant reachable again after %d degraded episode(s)", _degraded_episodes
+        )
+        if dropped:
+            logger.warning(
+                "%d chunk upserts were dropped while degraded and never reached "
+                "Qdrant — run scripts/backfill_qdrant.py to repair the collection",
+                dropped,
+            )
+        _degraded_reason = None
+        _degraded_episodes = 0
+        _writes_dropped_while_degraded = 0
+        _retry_after = 0.0
+
+    _qdrant_store = store
+    return store
+
+
+def degradation_state() -> dict[str, Any] | None:
+    """配置写着 qdrant、当前却停在内存索引时的现场。没降级就是 None。
+
+    给健康检查用：降级不报错，检索也照样出结果，唯一能看出来的地方就是这里。
+
+    ``errorType`` 与 ``reason`` 分开是因为 ``/health`` 不需要认证：异常消息里可能
+    带着 URL 一类的内部信息，所以对外只给类型名，完整的那份留在日志里。
+    """
+    if _degraded_reason is None:
+        return None
+    return {
+        "errorType": _degraded_reason.split(":", 1)[0],
+        "episodes": _degraded_episodes,
+        "writesDropped": _writes_dropped_while_degraded,
+        "retryInSeconds": max(0.0, round(_retry_after - time.monotonic(), 1)),
+    }
 
 
 def uses_qdrant() -> bool:
@@ -295,7 +378,11 @@ def uses_qdrant() -> bool:
 
 
 def reset_for_tests() -> None:
-    """清掉降级标记与客户端。只给测试用。"""
-    global _qdrant_store, _degraded
+    """清掉降级状态与客户端。只给测试用。"""
+    global _qdrant_store, _retry_after, _degraded_reason
+    global _degraded_episodes, _writes_dropped_while_degraded
     _qdrant_store = None
-    _degraded = False
+    _retry_after = 0.0
+    _degraded_reason = None
+    _degraded_episodes = 0
+    _writes_dropped_while_degraded = 0

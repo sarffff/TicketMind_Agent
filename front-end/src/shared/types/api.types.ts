@@ -135,6 +135,14 @@ export interface TicketDetail extends TicketSummary {
   /** 这张工单累计的模型成本。null = 未知，不是免费 */
   llmCost: string | null;
   closedAt: string | null;
+  /**
+   * 这位客户已积累的偏好——**下一张工单会把这些喂给模型**。
+   *
+   * 它来自客户画像而不是工单行，所以后端把它摆在响应的 `ticket` 之外；
+   * `getTicket` 取出来并到这一个对象上，界面上就是"这一屏能看到的东西"。
+   * 只有坐席写得进来，模型不参与：画像是会被后续每一单读到的长期状态。
+   */
+  customerPreferences: string[];
 }
 
 export interface TicketQueueResponse {
@@ -239,6 +247,12 @@ export interface CloseTicketResponse {
   ticketId: string;
   status: TicketStatus;
   resolution: string;
+}
+
+/** POST /tickets/{id}/preference：回的是**这位客户当前**的偏好全集，不是刚加的那条 */
+export interface CustomerPreferenceResponse {
+  ticketId: string;
+  preferences: string[];
 }
 
 /** GET /tickets/{id}/events 的一步。node/kind 是自由文本，界面按"有就显示"处理 */

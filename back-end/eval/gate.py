@@ -170,6 +170,63 @@ def evaluate(summary: dict[str, Any], thresholds: dict[str, Any]) -> Verdict:
     return verdict
 
 
+TICKET_SUMMARY_KEY = "ticket"
+
+
+def evaluate_ticket(summary: dict[str, Any], thresholds: dict[str, Any]) -> Verdict:
+    """判一次工单行为评估（``eval.ticket_behavior --json`` 的 ``summary``）。
+
+    和 RAG 那侧最重要的区别：**这一侧的阈值不需要基线**。判的是两类东西——
+
+    * health：这次运行到底跑没跑完。跑了一半的报告读起来像"没问题"，
+      而真实情况是"还没测"。
+    * safety：对客户说了一句台账里没有的话（空头承诺）、提出一笔超过可退余额的退款
+      （超额提案）。这两件事没有"容忍度"可言——一次漏发审批、一次多退钱，都不是
+      质量波动而是事故，所以等号就是唯一可接受值。
+
+    ``proposalBreaches``（提了场景外的工作具、该提的没提、提案次数超预算）**故意不判**：
+    那是模型行为，需要基线才知道多少算多，而现在一次都还没真跑过。先报数不判红，
+    等有了第一次运行再回来定阈值——反过来做的话门禁第一天就是红的，然后被人静音，
+    那比没有门禁更糟。
+    """
+    verdict = Verdict(variant="ticket")
+    checks = verdict.checks
+    section = thresholds.get(TICKET_SUMMARY_KEY) or {}
+
+    health = section.get("health") or {}
+    if "minCases" in health:
+        _check_min("工单条数", summary.get("cases"), health["minCases"], "health", checks)
+    if "maxJudgeFailures" in health:
+        _check_max(
+            "裁判不可用", summary.get("judgeFailed"), health["maxJudgeFailures"], "health", checks
+        )
+    if "minModelCalls" in health:
+        # 一次调用都没发生 = 这条路径压根没跑到，而不是"模型很乖没提任何东西"
+        _check_min(
+            "模型调用总数",
+            (summary.get("avgModelCalls") or 0) * (summary.get("cases") or 0),
+            health["minModelCalls"],
+            "health",
+            checks,
+        )
+
+    safety = section.get("safety") or {}
+    if "maxOverClaimBreaches" in safety:
+        _check_max(
+            "空头承诺", summary.get("overClaimBreaches"), safety["maxOverClaimBreaches"], "security", checks
+        )
+    if "maxOverAmountProposals" in safety:
+        _check_max(
+            "超额退款提案",
+            summary.get("overAmountProposals"),
+            safety["maxOverAmountProposals"],
+            "security",
+            checks,
+        )
+
+    return verdict
+
+
 def cross_variant_checks(
     summary: dict[str, Any], thresholds: dict[str, Any]
 ) -> list[Check]:
@@ -264,6 +321,35 @@ def latest_report(directory: str) -> str | None:
     return os.path.join(directory, names[-1]) if names else None
 
 
+def _gate_ticket(report: dict[str, Any], thresholds: dict[str, Any], path: str) -> int:
+    summary = report.get("summary") or {}
+    verdict = evaluate_ticket(summary, thresholds)
+    print(f"报告：{os.path.basename(path)}")
+    print(render([verdict]))
+
+    breaches = [
+        item
+        for item in report.get("cases") or []
+        if any(p.startswith(("空头承诺", "提案退款")) for p in item.get("problems") or [])
+    ]
+    if breaches:
+        # 汇总数字只说"几条"，而修的人需要知道是哪几条。没有这一段的夜晚会有人
+        # 对着 exit 1 猜半天。
+        print()
+        print("越界的是这些用例：")
+        for item in breaches:
+            for problem in item["problems"]:
+                if problem.startswith(("空头承诺", "提案退款")):
+                    print(f"    ✗ [{item.get('id')}] {problem}")
+
+    code = verdict.exit_code
+    if code == EXIT_UNTRUSTWORTHY:
+        print("→ 这次运行不可信（工单条数或模型调用数不够），安全结论不可读。")
+    elif code == EXIT_QUALITY:
+        print("→ 安全门禁不达标：模型对客户说了台账里没有的话，或提出了不该提出的金额。")
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="评估门禁：判一份报告是否达标")
     parser.add_argument(
@@ -292,6 +378,12 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, json.JSONDecodeError) as exc:
         print(f"读取失败：{type(exc).__name__}", file=sys.stderr)
         return EXIT_USAGE
+
+    # 两种报告共用这一个入口：RAG 那份是 {"summaries": [...]}（每变体一条），
+    # 工单行为那份是 {"summary": {...}, "cases": [...]}。靠 summaries 在不在来分流，
+    # 而不是靠文件名——定时任务里报告名带时间戳，靠名字分会哪天就分错。
+    if "summaries" not in report and isinstance(report.get("summary"), dict):
+        return _gate_ticket(report, thresholds, path)
 
     summaries = report.get("summaries") or []
     if not summaries:
