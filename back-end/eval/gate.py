@@ -34,6 +34,28 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any
 
+from eval import problem_labels
+from services.console import utf8_output
+
+# 逐条点名要在 problems 里找的前缀。绑定只发生在模块级这一处，所以
+# tests/test_eval_gate.py 能断言 `gate._BREACH_LABELS is problem_labels.BREACHES`——
+# 断 `is` 不判 `==`，因为等于一份的副本照样会各自漂。这份名单同时是
+# ticket_behavior.summarize 用来计数的键，两处手写之后报告里的数字和这里点名的
+# 用例就不是同一件事了，而两边都照样跑成功、照样退 0。
+_BREACH_LABELS = problem_labels.BREACHES
+
+
+def _counted(item: dict[str, Any]) -> bool:
+    """这条用例算不算进汇总数字。判据是生产者写进报告的 `measured` 字段：
+    做决定的那一步（``ticket_agent``）有没有真的答过。
+
+    缺字段（2026-10-17 之前的报告）按算进去处理——那时 summarize 的分母就是全量，
+    数字和被点名的用例本来就一致，用今天的判据去回判反而会让回放对不上。
+    """
+    if "measured" not in item:
+        return True
+    return bool(item["measured"])
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_THRESHOLDS = os.path.join(_HERE, "gate_thresholds.json")
 _REPORT_DIR = os.path.join(_HERE, "reports")
@@ -176,18 +198,23 @@ TICKET_SUMMARY_KEY = "ticket"
 def evaluate_ticket(summary: dict[str, Any], thresholds: dict[str, Any]) -> Verdict:
     """判一次工单行为评估（``eval.ticket_behavior --json`` 的 ``summary``）。
 
-    和 RAG 那侧最重要的区别：**这一侧的阈值不需要基线**。判的是两类东西——
+    和 RAG 那侧的区别只在有没有基线：
 
     * health：这次运行到底跑没跑完。跑了一半的报告读起来像"没问题"，
-      而真实情况是"还没测"。
+      而真实情况是"还没测"。判的是 `measured`（做决定的那一步真的答过的条数）而不
+      只是 `cases`（跑了多少条）——一条从没答过的工单不是样本，是缺席。
     * safety：对客户说了一句台账里没有的话（空头承诺）、提出一笔超过可退余额的退款
       （超额提案）。这两件事没有"容忍度"可言——一次漏发审批、一次多退钱，都不是
-      质量波动而是事故，所以等号就是唯一可接受值。
-
-    ``proposalBreaches``（提了场景外的工作具、该提的没提、提案次数超预算）**故意不判**：
-    那是模型行为，需要基线才知道多少算多，而现在一次都还没真跑过。先报数不判红，
-    等有了第一次运行再回来定阈值——反过来做的话门禁第一天就是红的，然后被人静音，
-    那比没有门禁更糟。
+      质量波动而是事故，所以等号就是唯一可接受值。0 是观测到的值，不是模型的性质，
+      别把它读成"这一侧不会出事"。
+    * quality：``proposalBreaches``（提了场景外的工具、该提的没提、提案次数超预算）。
+      判，但留余量。这不是让步而是测量学：同一套用例连着跑三轮，这个数字本身会抖，
+      而里面还混着一条**稳定复现**的过度提案缺陷——按"看到 1 条就判红"设阈值，
+      门禁会为一个没有任何回归的正常轮次亮红，那种红第二天就被静音，比没有门禁更糟。
+      余量留几条、其中几条是被缺陷长期占着的、什么时候该收回，全在
+      gate_thresholds.json 的 `ticket` 段里。**这里刻意不复述那些数字**：这个函数
+      上一版就是这么写的，等三轮重测完，文档里的数就成了假数——一份会漂的地方
+      不该存在两份。
     """
     verdict = Verdict(variant="ticket")
     checks = verdict.checks
@@ -196,6 +223,11 @@ def evaluate_ticket(summary: dict[str, Any], thresholds: dict[str, Any]) -> Verd
     health = section.get("health") or {}
     if "minCases" in health:
         _check_min("工单条数", summary.get("cases"), health["minCases"], "health", checks)
+    if "minMeasured" in health:
+        # 数据集有 20 条，但其中被模型通道抛错截掉的那些**不是样本**，是缺席。
+        # 拿 cases 当分母读阈值会让一份 18/20 的运行看起来和满员运行一样可信，
+        # 而软门那条容忍数恰恰是按满员标的
+        _check_min("有效样本", summary.get("measured"), health["minMeasured"], "health", checks)
     if "maxJudgeFailures" in health:
         _check_max(
             "裁判不可用", summary.get("judgeFailed"), health["maxJudgeFailures"], "health", checks
@@ -222,6 +254,12 @@ def evaluate_ticket(summary: dict[str, Any], thresholds: dict[str, Any]) -> Verd
             safety["maxOverAmountProposals"],
             "security",
             checks,
+        )
+
+    quality = section.get("quality") or {}
+    if "maxProposalBreaches" in quality:
+        _check_max(
+            "提案越界", summary.get("proposalBreaches"), quality["maxProposalBreaches"], "quality", checks
         )
 
     return verdict
@@ -323,34 +361,74 @@ def latest_report(directory: str) -> str | None:
 
 def _gate_ticket(report: dict[str, Any], thresholds: dict[str, Any], path: str) -> int:
     summary = report.get("summary") or {}
-    verdict = evaluate_ticket(summary, thresholds)
     print(f"报告：{os.path.basename(path)}")
+
+    # 先报"哪些条没算"，再判阈值。以前这里看到 unmeasured 非零就直接退 2，
+    # 等于把容忍度写死在门禁代码里。缺席多少条能接受是阈值该说的话
+    # （health.minMeasured），只有一个地方能改，也才只会被改一次。
+    dropped = [item for item in (report.get("cases") or []) if not _counted(item)]
+    if dropped:
+        print(
+            f"剔除 {len(dropped)}/{summary.get('cases', len(dropped))} 条"
+            f"（做决定的那一步没答过）：{', '.join(str(item.get('id')) for item in dropped)}"
+        )
+        print("  它们既没通过也没越界——没算进下面的数字。")
+
+    verdict = evaluate_ticket(summary, thresholds)
     print(render([verdict]))
 
-    breaches = [
-        item
+    waived = [
+        (item.get("id"), p)
         for item in report.get("cases") or []
-        if any(p.startswith(("空头承诺", "提案退款")) for p in item.get("problems") or [])
+        for p in item.get("problems") or []
+        if p.startswith(problem_labels.WAIVED)
+    ]
+    if waived:
+        # 免判不是没事。读一份报告的人要先知道这一轮被网络吃掉了多少条判项，
+        # 否则"越界 0"会被读成"模型这次很准"
+        print()
+        print(f"因模型通道抛错免判了 {len(waived)} 条「没提该提的」：")
+        for case_id, problem in waived:
+            print(f"    · [{case_id}] {problem}")
+
+    breaches = [
+        item for item in report.get("cases") or []
+        if _counted(item) and any(p.startswith(_BREACH_LABELS) for p in item.get("problems") or [])
     ]
     if breaches:
         # 汇总数字只说"几条"，而修的人需要知道是哪几条。没有这一段的夜晚会有人
-        # 对着 exit 1 猜半天。
+        # 对着 exit 1 猜半天。达标时也照打：软门容忍的那一条，得让人看得见是哪条
+        # 才谈得上"下次别再加一条"。
         print()
         print("越界的是这些用例：")
         for item in breaches:
             for problem in item["problems"]:
-                if problem.startswith(("空头承诺", "提案退款")):
+                if problem.startswith(_BREACH_LABELS):
                     print(f"    ✗ [{item.get('id')}] {problem}")
 
     code = verdict.exit_code
     if code == EXIT_UNTRUSTWORTHY:
-        print("→ 这次运行不可信（工单条数或模型调用数不够），安全结论不可读。")
+        print("→ 这次运行不可信（跑的条数、真正测到的条数或模型调用数不够），安全结论不可读。")
     elif code == EXIT_QUALITY:
-        print("→ 安全门禁不达标：模型对客户说了台账里没有的话，或提出了不该提出的金额。")
+        # 两类红要分开说，因为它们要修的东西完全不同：硬门是事故，去查护栏与提示词
+        # 里的事实来源；软门是模型变激进了，先看是不是同一个用例连着翻
+        hard = [c.name for c in verdict.other_failures if c.category == "security"]
+        soft = [c.name for c in verdict.other_failures if c.category != "security"]
+        if hard:
+            print(f"→ 安全门禁不达标：{'、'.join(hard)}。这不是质量波动，是事故。")
+        if soft:
+            print(
+                f"→ 质量门禁不达标：{'、'.join(soft)} 超出了实测抖动范围"
+                "（余量多少条写在 gate_thresholds.json 的 ticket.quality，含它的适用边界）。"
+            )
     return code
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 门禁最不该失败的时机正是它要报不合格的那一刻，而渲染 verdict 会打 `✗`——
+    # 那个字符不在 GBK 里，Windows 上输出被重定向时直接抛 UnicodeEncodeError
+    # （见 services/console.py）
+    utf8_output()
     parser = argparse.ArgumentParser(description="评估门禁：判一份报告是否达标")
     parser.add_argument(
         "report",

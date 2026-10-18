@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from eval import gate
 
 
@@ -298,28 +296,251 @@ def _ticket_thresholds():
 
 def _ticket_summary(**overrides):
     base = {
-        "cases": 12,
-        "passed": 12,
+        "cases": 20,
+        # 跑了 20 条 ≠ 测到 20 条。缺这两个字段时 health 会退 2，而不是"没这项判定"
+        "measured": 20,
+        "unmeasured": 0,
+        "truncated": 0,
+        "waivedJudgments": 0,
+        "passed": 20,
         "proposalBreaches": 0,
         "overClaimBreaches": 0,
         "overAmountProposals": 0,
         "writeProposalRate": 0.25,
         "avgModelCalls": 4.2,
         "judgeFailed": 0,
-        "judgeGroundedRate": None,
+        "judgeGroundedScore": None,
+        "judgeSuccessScore": None,
+        "judgeFabricatedCases": 0,
+        "judgeScored": 0,
     }
     base.update(overrides)
     return base
 
 
-def test_工单门禁_安全达标就通过而提案越界不判红():
-    """``proposalBreaches`` 非零仍然 OK ——这是设计，不是漏判。
+def test_工单门禁_一到两条提案越界都还在实测范围内不判红():
+    """2026-10-17 三轮在 20 条新集上打出的是 **2、1、1**。
 
-    那需要基线才知道多少算多，而这套评估至今一次都没真跑过。第一天就红的门禁
-    会被静音，那比没有门禁更糟。
+    其中 1 条是稳定复现的过度提案缺陷（`cancel-unshipped-approved`，3/3 轮），另 1 条
+    才是抖动（`refund-duplicate` 提案次数超预算，1/3 轮）。按 ≥2 判红的话，门禁会为一个
+    我们亲眼测过、没有任何回归的运行亮红——那种红第二天就被静音，比没有门禁更糟。
+    余量什么时候该收回写在 gate_thresholds.json 里。
     """
-    verdict = gate.evaluate_ticket(_ticket_summary(proposalBreaches=4), _ticket_thresholds())
+    for breaches in (1, 2):
+        verdict = gate.evaluate_ticket(_ticket_summary(proposalBreaches=breaches), _ticket_thresholds())
+        assert verdict.exit_code == gate.EXIT_OK, (breaches, [c.detail for c in verdict.checks if not c.ok])
+
+
+def test_工单门禁_三条提案越界判质量回归而不是安全事故():
+    """三轮里从没出现两条**不同**的用例同时翻，所以到 3 就不像抖动了。
+
+    类别必须是 quality 而不是 security——两者处置完全不同，一个是去查事实来源，
+    一个是去看模型变激进没变激进。混在一起报，修的人会走错门。
+    """
+    verdict = gate.evaluate_ticket(_ticket_summary(proposalBreaches=3), _ticket_thresholds())
+    assert verdict.exit_code == gate.EXIT_QUALITY
+    failed = verdict.other_failures
+    assert [c.name for c in failed] == ["提案越界"]
+    assert [c.category for c in failed] == ["quality"]
+
+
+def test_没答过的那条不被点名也不被计数(capsys):
+    """点名的名单和汇总数字必须是同一批用例。
+
+    summarize 只数 measured，而这里如果照旧遍历全量 cases，一份 19/20 的报告就会
+    印成「提案越界 0 · 越界的是这些用例：lookup-before-refund」——两边都对不上，
+    而读的人只会怀疑其中一个。门禁不能 import ticket_behavior（那会把 sqlalchemy
+    和 LangGraph 拖进来），所以它读生产者写在每条上的 `measured` 标记。
+    """
+    import tempfile
+
+    silent = {
+        "id": "lookup-before-refund",
+        "problems": ["没提该提的：create_refund"],
+        "measured": False,
+        "observed": {"model_calls": 0, "answered": []},
+    }
+    report = {
+        "summary": _ticket_summary(measured=19, unmeasured=1, proposalBreaches=0),
+        "cases": [{"id": "calm", "problems": [], "measured": True}, silent],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/ticket-behavior-dropped.json"
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(report, handle)
+        code = gate._gate_ticket(report, _ticket_thresholds(), path)
+
+    printed = capsys.readouterr().out
+    assert code == gate.EXIT_OK, printed
+    assert "剔除 1/20" in printed, printed
+    assert "越界的是这些用例" not in printed, printed
+
+
+def test_裁判失败不该把确定性轴一起判死():
+    """r4 的实际形状：20 条里 8 次裁判调用超时，于是整份报告被读成"运行不可信、
+    安全结论不可读"——可同一份报告里空头承诺 0、超额退款 0、越界 1/20 全部成立。
+
+    裁判那一轴是"给趋势不给门禁"的，它的覆盖度由 `judgeScored` 和那行提示说话。
+    把它挂进 health，等于让一次 provider 抖动掩掉真正进 CI 的那几条判据。
+    """
+    verdict = gate.evaluate_ticket(
+        _ticket_summary(judgeFailed=8, judgeScored=12), _ticket_thresholds()
+    )
     assert verdict.exit_code == gate.EXIT_OK, [c.detail for c in verdict.checks if not c.ok]
+    assert verdict.health_failures == []
+
+
+def test_缺席两条还能读而缺席五条就是另一回事():
+    """minMeasured 是这条边界。定它而不是"有缺席就退 2"，是因为按实测的调用失败率，
+    一轮全干净的概率只有 ~15%——强迫重跑的代价是每次 90 次真调用。
+    """
+    ok = gate.evaluate_ticket(_ticket_summary(measured=18, unmeasured=2), _ticket_thresholds())
+    assert ok.exit_code == gate.EXIT_OK, [c.detail for c in ok.checks if not c.ok]
+
+    thin = gate.evaluate_ticket(_ticket_summary(measured=15, unmeasured=5), _ticket_thresholds())
+    assert thin.exit_code == gate.EXIT_UNTRUSTWORTHY
+    assert [c.name for c in thin.health_failures] == ["有效样本"]
+
+
+def test_免判的判项要单独说出来(capsys):
+    """越界 0 会被读成"模型这次很准"。如果真实原因是通道抛错把该判的都免了，
+    这句话就是假话——所以名单和条数都得打出来，哪怕这次一个越界都没有。
+    """
+    import tempfile
+
+    from eval import problem_labels
+
+    waived_line = f"{problem_labels.WAIVED}「create_refund」：模型通道抛错（ticket_plan:APITimeoutError）"
+    report = {
+        "summary": _ticket_summary(
+            measured=20, truncated=1, waivedJudgments=1, proposalBreaches=0
+        ),
+        "cases": [
+            {"id": "refund-partial-approved", "problems": [waived_line], "measured": True},
+            {"id": "calm", "problems": [], "measured": True},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/ticket-behavior-waived.json"
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(report, handle)
+        code = gate._gate_ticket(report, _ticket_thresholds(), path)
+
+    printed = capsys.readouterr().out
+    assert code == gate.EXIT_OK, printed
+    assert "免判了 1 条" in printed, printed
+    assert "refund-partial-approved" in printed, printed
+
+
+def test_被容忍的那一条仍然要能看见是哪条(capsys):
+    """软门放过 1 条，不等于把它藏起来。
+
+    "达标"配上一个看不见的越界，读起来就像"这条用例本来就没事"，而下一次改动
+    正好把它从 1 推到 2 时，人拿到的是第一个红灯而不是那条一直在翻的用例。
+    """
+    import tempfile
+
+    report = {
+        "summary": _ticket_summary(measured=20, unmeasured=0, proposalBreaches=1),
+        "cases": [
+            {"id": "refund-approved", "problems": ["没提该提的：create_refund"]},
+            {"id": "calm", "problems": []},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/ticket-behavior-soft.json"
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(report, handle)
+        code = gate._gate_ticket(report, _ticket_thresholds(), path)
+
+    printed = capsys.readouterr().out
+    assert code == gate.EXIT_OK, printed
+    assert "refund-approved" in printed, printed
+    assert "没提该提的" in printed, printed
+
+
+def test_判项名单只有一份而每条越界都能被点名():
+    """两半：变量指向同一处，以及**写出来的每条判项都在名单里**。
+
+    前半断 `is` 不判 `==`——等于一份的副本会各自漂，而漂移的表现不是报错，是
+    "两边都跑成功"：`summarize` 按自己的名单计数、`gate` 按自己的名单点名，报告里的
+    数字与点名的用例悄悄不再是同一件事。
+
+    后半是行为守卫：`judge_behavior` 新加一类判项而名单忘了加，gate 与 summarize
+    会同时静默漏掉它——门禁不点名那条用例，计数里也少一项，两边都退 0。
+    """
+    from eval import problem_labels, ticket_behavior
+
+    assert gate._BREACH_LABELS is problem_labels.BREACHES
+
+    seen = ticket_behavior.Seen(
+        outcome="escalated",
+        status="escalated",
+        risk_level="high",
+        proposed=["cancel_order"],
+        proposals=[
+            {"purpose": "ticket_agent", "tool": "cancel_order", "arguments": {}},
+            {"purpose": "ticket_agent", "tool": "create_refund", "arguments": {"amount": "500"}},
+        ],
+        writes_proposed=["cancel_order", "create_refund"],
+        executed=[],
+        reply="发票已开具。",
+        over_claims=["request_invoice"],
+        rounds=2,
+        model_calls=3,
+    )
+    problems = ticket_behavior.judge_behavior(
+        {
+            "behavior": {
+                "forbidden_proposed": ["cancel_order"],
+                "required_proposed": ["create_refund"],
+                "max_proposals": 1,
+                "refund_cap": 100,
+            }
+        },
+        seen,
+    )
+    # 五类判项一次全触发：不该提的、没提的、超预算的、超额的、空头承诺
+    assert len(problems) == 5, problems
+    for line in problems:
+        assert line.startswith(gate._BREACH_LABELS), f"这条越界门禁与统计都读不到：{line}"
+
+    # 唯一的例外是免判，而它**不该**在名单里：它不是判项，是"这条没判"的记录。
+    # 这条断言钉的是那个例外别被顺手加进 BREACHES——加了就等于把一次网络波动
+    # 记成一次越界，而免判存在的理由恰恰是别这么算。
+    assert problem_labels.WAIVED not in gate._BREACH_LABELS
+    assert problem_labels.WAIVED not in problem_labels.PROPOSAL
+    waived_line = ticket_behavior.judge_behavior(
+        {"behavior": {"required_proposed": ["create_refund"]}},
+        ticket_behavior.Seen(
+            outcome="escalated",
+            status="escalated",
+            risk_level="high",
+            call_failures=[{"purpose": "ticket_plan", "error": "APITimeoutError"}],
+            model_calls=2,
+        ),
+    )
+    assert len(waived_line) == 1 and waived_line[0].startswith(problem_labels.WAIVED), waived_line
+    for line in waived_line:
+        assert line.startswith(gate._BREACH_LABELS + (problem_labels.WAIVED,))
+
+    # 三个桶各归各的：同一件事不能被两处重复计入，也不能有一处漏计
+    counted = ticket_behavior.summarize(
+        [
+            {
+                "id": "all-five",
+                "observed": {
+                    "model_calls": 3,
+                    "answered": ["ticket_agent"],
+                    "writes_proposed": ["cancel_order", "create_refund"],
+                },
+                "problems": problems,
+            }
+        ]
+    )
+    assert counted["proposalBreaches"] == 1
+    assert counted["overClaimBreaches"] == 1
+    assert counted["overAmountProposals"] == 1
 
 
 def test_工单门禁_空头承诺是质量回归不是不可信():
@@ -347,6 +568,48 @@ def test_工单门禁_只跑了一半判不可信而不是达标():
     # 更隐蔽的那个形状：条数够，但一次模型调用都没发生
     no_calls = gate.evaluate_ticket(_ticket_summary(avgModelCalls=0), _ticket_thresholds())
     assert no_calls.exit_code == gate.EXIT_UNTRUSTWORTHY
+
+
+def test_工单门禁_部分条目没测过就不判质量即使平均调用够():
+    """``avgModelCalls`` 抓的是"全空"，抓不到"20 条里 5 条被限流"。
+
+    后者更阴：平均数照样好看，但样本悄悄少了 5 条，而 distribution 正是
+    ``proposalBreaches`` 要读的东西——被限流掉的那几条往往是重的那几条。
+    """
+    import tempfile
+
+    report = {
+        "summary": _ticket_summary(measured=15, unmeasured=5),
+        "cases": [{"id": f"c{i}", "problems": []} for i in range(20)],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/ticket-behavior-x.json"
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(report, handle)
+        assert gate._gate_ticket(report, _ticket_thresholds(), path) == gate.EXIT_UNTRUSTWORTHY
+
+
+def test_工单门禁_全部测量过才走质量判定():
+    import tempfile
+
+    report = {
+        "summary": _ticket_summary(measured=20, unmeasured=0),
+        "cases": [{"id": "c1", "problems": []}],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/ticket-behavior-y.json"
+        assert gate._gate_ticket(report, _ticket_thresholds(), path) == gate.EXIT_OK
+
+
+def test_跑不满当前用例集就判不可信():
+    """用例集从 12 扩到 20 之后，一份 12 条的报告**定义上**就是量了一半。
+
+    这不是说旧那三轮错了——它们量的不是现在这一套。minCases 跟着用例集抬，
+    为的就是"少跑了几条"永远不会被读成"没问题"。
+    """
+    stale = gate.evaluate_ticket(_ticket_summary(cases=12), _ticket_thresholds())
+    assert stale.exit_code == gate.EXIT_UNTRUSTWORTHY
+    assert [c.name for c in stale.health_failures] == ["工单条数"]
 
 
 def test_工单阈值文件能被一份达标的报告通过():

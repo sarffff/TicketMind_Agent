@@ -30,6 +30,7 @@ from routers import (
 )
 from services import prompt_library
 from services import security_preflight
+from services.console import utf8_output
 from services import skill_library
 from services import subagent
 from services import ingest_clean
@@ -393,6 +394,9 @@ async def startup():
     后者在下面的工单行里必须看得见——限额数字没打出来，"当日退款上限其实没配"这种
     配置就会一直活到第一笔超额退款。
     """
+    # 放在最前面：横幅里有带 `⚠` 的警告分支，GBK 控制台上打不出来会抛
+    # UnicodeEncodeError——那等于"配置有问题"反而让服务起不来
+    utf8_output()
     security_preflight.enforce(settings, logger=logger)
     init_db()
     # 提示词模板有问题（占位符对不上、条件段没闭合、默认版本已归档）就在这里

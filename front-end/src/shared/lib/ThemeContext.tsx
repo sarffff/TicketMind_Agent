@@ -69,10 +69,15 @@ function resolve(mode: ThemeMode): ResolvedTheme {
 }
 
 /**
- * 在 React 挂载之前上一次类名。
+ * 在 React 挂载之前上一次类名。**这是兜底，不是主路径**。
  *
- * 不做这件事的话，每次启动都会先以 `:root`（浅色）画一帧再翻成深色——
- * 桌面端整窗闪一下白，比配色不好看更像一个坏掉的程序。
+ * 主路径是 `public/theme-boot.js`：它由 index.html 以经典脚本加载，在 body 画帧之前
+ * 就跑完了。放在这里而不是只靠那个文件，是因为 `main.tsx` 是模块脚本（天生 defer），
+ * 而引导脚本万一没跑成——存储被禁用、静态资源 404、CSP 改动——界面至少要跟
+ * `ThemeProvider` 挂起来时算出的那一份一致，否则会出现"React 以为深色、屏幕是浅色"。
+ *
+ * 不做任何一处的话，每次启动都会先以 `:root`（浅色）画一帧再翻成深色——桌面端整窗
+ * 闪一下白，比配色不好看更像一个坏掉的程序。
  */
 export function applyStoredThemeBeforeMount() {
   const root = document.documentElement;

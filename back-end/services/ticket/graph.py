@@ -633,7 +633,12 @@ def build_graph(runtime: TicketRuntime) -> StateGraph:
             "loaded_skills": [],
             "delegations": 0,
             "messages": [
-                *[{"role": "system", "content": block} for block in blocks],
+                # 合成**一条** system 而不是并排几条：有些自部署的 provider 会把"不止
+                # 一条 system"报成 `System message must be at the beginning.`——那句错误
+                # 信息是误导的，真实约束是"只能有一条"。2026-10-11 就撞在这上面，症状毫无
+                # 提示性：understand 与 plan 都过了，只有推理循环 12/12 全挂，报告里提案
+                # 一片零。这些块本来就在列表最前面，合并只会让那段可缓存的前缀更完整。
+                {"role": "system", "content": "\n\n".join(blocks)},
                 {"role": "user", "content": _brief(ticket, profile_text, safe_text)},
             ],
         }

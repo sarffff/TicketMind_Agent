@@ -17,7 +17,7 @@ cd back-end
 python -m eval.ticket_guardrail --fail-on-breach    # 工单护栏门禁（离线、零成本）
 
 python -m eval.ticket_behavior --limit 3            # 行为评估小样本（真调模型）
-python -m eval.ticket_behavior                      # 全量 12 条
+python -m eval.ticket_behavior                      # 全量 20 条
 python -m eval.ticket_behavior --judge              # 再加一次裁判调用评"做得对不对"
 python -m eval.ticket_behavior --json               # 机器可读
 
@@ -27,12 +27,34 @@ python -m eval.run --variants baseline,dense-only,rerank
 python -m eval.run --variants all                   # 全部变体对照
 ```
 
+`--judge` 那条轴的四个坑（2026-10-17 第一次真跑就全撞上了；修之前它**从没能有效工作过**）：
+
+1. 裁判调用要排在 `LLMRateGate` 后面。前面每条工单已经连打了 4~6 次，配额窗口正满，
+   不包的话一上手就 429 → 整轮"裁判不可用"，而钱照花、通过率照打印。
+2. 证据里必须有**工具实际返回的内容**。读类工具（`lookup_order`、`lookup_logistics`）
+   不写 `cs_operations`，只给「提案 + 执行掉的写」当证据，等于让每一次正常查询都被判成
+   "编造工具输出"。返回值按 `tool_call_id` 对回工具名，而同一个 id 跨轮次会重复
+   （替身每轮都从 `call-0` 开始），所以按顺序消费，不建 id→名字 的字典。
+3. 非办结那条（被拒 / 转人工 / 等审批）没有 `resolution_note`，裁判收到空回答就直接
+   判"空回答"——而那几条恰恰最该评：被拒之后有没有如实解释，没有确定性判据。
+   现在回落到轨迹里最后一段 assistant 正文。**这同时扩大了"空头承诺"的判据面**，
+   所以它和只看办结回复的旧运行不是同一个口径。
+4. 裁判打的是 1~5 分，读成均值（`judgeGroundedScore` / `judgeSuccessScore`）并写明
+   "几条打了分"。上一版汇总找的是 `"有据=True"` 这个**永远不会出现**的子串，于是那条
+   指标恒等于 0.0——一个看起来有数据、实际是常数的指标，比报错危险得多。
+5. **每条工具返回的截断上限要按"被引用的正文有多长"定。** 缺省曾随手取 700，而
+   `refund-playbook` 正文 1095 字符、"到账时间"写在第 1063 字符——模型唯一引用的那段
+   被剪掉，裁判只能判"无工具证据"，r4 的 `有据均值 3.583` 里就混着这一份我自己的锅。
+   现在上限 2000，并有一条守卫测试（`test_规程正文必须整份进得了裁判的证据`）钉住它。
+   总预算仍由 `judge._EVIDENCE_MAX_CHARS`（4000）兜着，放大这一项不增加成本。
+
 RAG 报告写到 `eval/reports/`：`.md` 是对照表，`.json` 是逐题明细（含裁判理由与完整回答）。
 
 `eval.run` 与 `eval.ticket_behavior` 会真实调用模型与 embedding 接口，**产生费用**。
 RAG 那侧开销约为 `问题数 × 变体数 × (1 次生成 + 1 次裁判)`，加上检索本身的 embedding
-调用；行为评估那侧约为 `工单数 × (3~8 次调用)`（理解 + 规划 + 推理循环，`--judge` 再
-+1）。先用 `--limit` 估算。
+调用；行为评估那侧实测是 **每条工单 4.65 次调用、一轮 20 条 ≈ 93 次**（2026-10-17 r1，
+理解 + 规划 + 推理循环，`--judge` 每条再 +1）。跑三轮标定阈值就是 ~280 次，
+不是几十次——先用 `--limit 1` 探连通性并拿到真实的每条调用数，再决定跑几轮。
 
 > 本文后半部分有一整篇讲的是**对话工作台的 Agent 评估**（`run_agent.py` /
 > `agent_runner.py` / `datasets/agent_tasks.jsonl`）。那套模块已随通用对话能力一起
@@ -56,9 +78,9 @@ RAG 那侧开销约为 `问题数 × 变体数 × (1 次生成 + 1 次裁判)`�
 | `run.py` | RAG 评估 CLI 与报告渲染 |
 | `gate.py` + `gate_thresholds.json` | 阈值化的回归判定，区分"模型变差"与"测量坏了" |
 | `calibration.py` | 裁判一致性：同一批答案换裁判会不会给出不同结论 |
-| `datasets/ticket_guardrails.jsonl` | 12 张工单：该挂审的、该挡的、该幂等的、该拒答的，以及一条"把退款塞进委派去绕过人审"。每条同时带 `expect`（护栏那半的落库期望）和 `behavior`（行为那半的提案期望 + rubric），两个面各取各的字段 |
+| `datasets/ticket_guardrails.jsonl` | 20 张工单：该挂审的、该挡的、该幂等的、该拒答的，以及一条"把退款塞进委派去绕过人审"。每条同时带 `expect`（护栏那半的落库期望）和 `behavior`（行为那半的提案期望 + rubric），两个面各取各的字段 |
 | `ticket_guardrail.py` | 工单处置的护栏评估：在通道边界打桩，判据只取落库事实；案例可用 `settings` 字段临时打开配置（委派那一半只有打开才存在，跑完原样还回去） |
-| `ticket_behavior.py` | 工单行为评估：同一套夹具换成真实模型，量"模型会不会提不该提的"。提案越界、退款金额超可退余额、回复承诺台账里没有的动作——前两条读案例的 `behavior` 块，第三条对所有案例生效 |
+| `ticket_behavior.py` | 工单行为评估：同一套夹具换成真实模型，量"模型会不会提不该提的"。提案越界、退款金额超可退余额、回复承诺台账里没有的动作——前两条读案例的 `behavior` 块，第三条对所有案例生效。**模型通道抛错的工单只免判「没提该提的」**（截断在半路时"没提"量的是网络），其余判项照旧计，免判条数写在 `waivedJudgments`；做决定的那一步从没答过的条才算没测到，逐条结论写在报告的 `measured` 字段上，能不能当基线由 `health.minMeasured` 判 |
 | `../prompts/eval_rag_answer/` | 回答提示词的各个版本（提示词也是被扫的维度之一） |
 
 语料是自造的，不含任何真实数据，因此可以提交进仓库、结果可复现。

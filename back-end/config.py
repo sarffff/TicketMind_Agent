@@ -343,9 +343,14 @@ class Settings(BaseSettings):
     # cooldown:撞上 429 且服务端没给 Retry-After 时,退避多少秒再重试。
     # max_retries:撞上 429 后重试几次(含按配额窗口退避)。默认 12 次是给
     #   一分钟配额窗口留下足够余量;retries 是给「重试次数」的兜底。
+    # transport_retries:超时/连接断开这类重试几次。**刻意比 429 那档小得多**——
+    #   429 是"等一会儿就有",超时是"这一条请求本身慢了",12 次 x 8 秒只会在一个
+    #   真死的 provider 上白等 96 秒/次。2 次是"网络抖一下"和"provider 坏了"
+    #   之间那条尽量便宜的分界;再高就该去看 provider 而不是让脚本扛。
     EVAL_LLM_MIN_INTERVAL_SECONDS: float = 0.5
     EVAL_LLM_RATE_LIMIT_COOLDOWN_SECONDS: float = 8.0
     EVAL_LLM_MAX_RATE_RETRIES: int = 12
+    EVAL_LLM_MAX_TRANSPORT_RETRIES: int = 2
 
     # HyDE(Hypothetical Document Embeddings):先让辅助模型编一段假答案,拿它去
     # 检索。反直觉但有效——用户的问题和文档的措辞常常不在同一个语域("报销要几天"
@@ -743,8 +748,6 @@ class Settings(BaseSettings):
     def utility_model(self) -> str:
         """辅助任务(摘要/改写/重排/记忆抽取)实际使用的模型"""
         return self.LLM_UTILITY_MODEL or self.LLM_MODEL
-
-    @property
 
     @property
     def judge_model(self) -> str:

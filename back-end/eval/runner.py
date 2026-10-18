@@ -16,7 +16,6 @@ Agent 循环涉及多轮工具决策，方差大、成本高，适合单独设�
 """
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
@@ -24,15 +23,14 @@ import os
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, TypeVar
-
-from openai import RateLimitError
+from typing import Any
 
 from config import settings
 from database import SessionLocal
 from eval import metrics
 from eval.corpus_degrade import degrade_corpus_file
 from eval.judge import AnswerJudge, JudgeVerdict
+from eval.rate_gate import LLMRateGate
 from eval.variants import Variant
 from models import Document, User
 from services.knowledge_service import KnowledgeService
@@ -63,75 +61,8 @@ EVAL_USER_ID = "eval-harness"
 _ANSWER_MAX_TOKENS = 3072
 
 
-_T = TypeVar("_T")
-
-
-class _LLMRateGate:
-    """评估链路的 LLM 限流闸:防突发 + 撞 429 按配额窗口退避后重试。
-
-    ```
-    completion = await gate.call(lambda: adapter.complete(...))
-    verdict    = await gate.call(lambda: judge.judge(...))
-    ```
-
-    为什么评估需要这个,而线上不需要:线上每次回答之间隔着真实用户的输入节奏,
-    突发天然被摊开;评估是一台脚本在几分钟内把几百次调用打出去,``eval_answer``
-    和 ``judge`` 又共用同一个账号的配额——2026-08-27 那轮 3 变体评估因此吃了
-    **211 次 HTTP 429**。SDK 自带的指数退避(0.5s→1s→2s…)在分钟级配额窗口面前
-    约等于不退避,退避完还是 429,于是 ``max_retries=1`` 很快就放弃,
-    直接导致 rerank-api 整轮 54/54 答案生成为空。
-
-    这层兜底只在这一个文件里用,不影响线上路径:
-
-    - ``min_interval`` 强制相邻 LLM 调用至少隔开这么长时间,防突发;
-    - 撞上 ``RateLimitError`` 时按 ``Retry-After``(缺省则退 ``cooldown``)
-      退避后重试,最多 ``max_retries`` 次,把分钟窗口让过去再继续。
-    """
-
-    def __init__(self) -> None:
-        self._min_interval = settings.EVAL_LLM_MIN_INTERVAL_SECONDS
-        self._cooldown = settings.EVAL_LLM_RATE_LIMIT_COOLDOWN_SECONDS
-        self._max_retries = settings.EVAL_LLM_MAX_RATE_RETRIES
-        self._last_start = 0.0
-        self._lock = asyncio.Lock()
-
-    @staticmethod
-    def _retry_after(exc: Exception) -> float:
-        """从 429 响应头里读服务端建议的等待秒数。没有则返回 0。"""
-        headers = getattr(getattr(exc, "response", None), "headers", None) or {}
-        try:
-            return float(headers.get("retry-after", 0))
-        except (TypeError, ValueError):
-            return 0.0
-
-    async def call(self, fn: Callable[[], Awaitable[_T]]) -> _T:
-        """执行一次受节流的 LLM 调用。撞 429 按窗口退避后重试。"""
-        for attempt in range(self._max_retries + 1):
-            async with self._lock:
-                now = time.monotonic()
-                delay = self._last_start + self._min_interval - now
-                self._last_start = now + max(delay, 0.0)
-            if delay > 0:
-                await asyncio.sleep(delay)
-            try:
-                return await fn()
-            except RateLimitError as exc:
-                if attempt >= self._max_retries:
-                    raise
-                wait = max(self._retry_after(exc), self._cooldown)
-                logger.warning(
-                    "LLM rate limited (attempt %s/%s); backing off %.1fs [Retry-After=%.1fs]",
-                    attempt + 1,
-                    self._max_retries,
-                    wait,
-                    self._retry_after(exc),
-                )
-                await asyncio.sleep(wait)
-        raise RuntimeError("unreachable")
-
-
 # 单例:一个评估进程里所有变体共用同一把锁,配额是账号级的,不是变体级的。
-_RATE_GATE = _LLMRateGate()
+_RATE_GATE = LLMRateGate()
 
 
 def ensure_eval_user(session: Any) -> None:

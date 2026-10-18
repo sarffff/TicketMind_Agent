@@ -19,6 +19,7 @@ from typing import Any
 
 from eval import metrics, runner
 from eval.variants import VARIANTS, resolve
+from services.console import utf8_output
 from services.clock import now as app_now
 
 _REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
@@ -613,6 +614,7 @@ def render_variance(variance: dict[str, Any]) -> list[str]:
 
 
 async def main() -> None:
+    utf8_output()  # 报告渲染里有 `⚠`，GBK 控制台上会直接崩在打印那一刻
     parser = argparse.ArgumentParser(description="RAG 配置变体评估")
     parser.add_argument(
         "--variants",
