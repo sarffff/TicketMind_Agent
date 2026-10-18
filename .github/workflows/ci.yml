@@ -37,6 +37,59 @@ jobs:
         run: python -c "from services import prompt_library; prompt_library.validate()"
       - name: 运行测试
         run: python -m pytest -v --tb=short
+      # 这套门禁离线、不花钱、没有网络依赖，判的是"该挂审的挂了吗、退款重复了吗、
+      # 超额了吗、委派有没有绕过审批"。它不在 CI 上的一天，改坏工单图就可以安静地
+      # 合进 main。
+      - name: 工单护栏门禁（漏投一次审批就红）
+        run: python -m eval.ticket_guardrail --fail-on-breach
+
+  schema:
+    name: 迁移与 schema（MySQL 空库从零）
+    runs-on: ubuntu-latest
+    # 为什么要专门起一个 MySQL 跑这件事：开发期根本走不到这条路径。init_db 用的是
+    # create_all + stamp，压根不执行迁移；于是 0001_baseline 跟着 models.py 漂移了
+    # 很久都没人发现——新库里 documents 一出生就带着 content_hash，alembic upgrade
+    # head 跑到 0006 撞 Duplicate column name，整条链在空库上从头跑不通，而 README
+    # 的手动部署路径写的正是这一条。这个 job 就是把"新环境能不能建起来"钉成门禁。
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-password
+          MYSQL_DATABASE: ticketmind_schema
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pci-root-password"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+    env:
+      JWT_SECRET_KEY: ci-only-secret-key-not-for-production-0123456789
+      WORKING_DIR: back-end
+      DATABASE_URL: "mysql+pymysql://root:ci-root-password@127.0.0.1:3306/ticketmind_schema"
+      LLM_API_KEY: test-key
+      LLM_BASE_URL: https://example.invalid/v4/
+    defaults:
+      run:
+        working-directory: back-end
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: back-end/requirements.txt
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+      - name: 空库上跑完整条迁移链
+        run: alembic upgrade head
+      # --gate 是这条路径上唯一的判红方式：脚本默认"拿到结论就返回 0"（启动体检要靠
+      # 那个契约把"检查不可用"和"库要迁移"分开），CI 要的恰恰是后者为真就红。
+      - name: 版本与表级差集必须合格
+        run: python scripts/check_schema_drift.py --gate
+      - name: 再跑一次 upgrade 必须是幂等的
+        run: alembic upgrade head
 
   frontend:
     name: 前端构建 (tsc + vite)

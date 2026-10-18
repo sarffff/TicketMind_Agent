@@ -4,6 +4,7 @@ import type {
   AuditVerifyResponse,
   AuthResponse,
   CloseTicketResponse,
+  CustomerPreferenceResponse,
   CsatResponse,
   DecisionRequest,
   DocumentChunkView,
@@ -272,9 +273,14 @@ export class ApiClient {
   }
 
   getTicket(ticketId: string): Promise<TicketDetail> {
-    return this.get<TicketDetail>(`/tickets/${encodeURIComponent(ticketId)}`).then(
-      (body) => (body as unknown as { ticket: TicketDetail }).ticket
-    );
+    return this.get<TicketDetail & { ticket: TicketDetail }>(
+      `/tickets/${encodeURIComponent(ticketId)}`
+    ).then((body) => ({
+      ...body.ticket,
+      // 画像在响应里摆在 ticket 之外（那是客户的状态不是工单的状态），但对这一屏
+      // 来说它是"能看见的事实"之一，所以并进来。缺字段按没有偏好处理，不是未知。
+      customerPreferences: body.customerPreferences ?? [],
+    }));
   }
 
   getTicketEvents(
@@ -317,6 +323,22 @@ export class ApiClient {
     return this.post<CloseTicketResponse>(
       `/tickets/${encodeURIComponent(ticketId)}/close`,
       { resolution, note }
+    );
+  }
+
+  /**
+   * 给这位客户记一条偏好（"不要打电话，发邮件"这类）。
+   *
+   * 请求体是 snake_case（仓库约定），响应是这位客户**当前**的偏好全集而不是刚加的那条
+   * ——幂等去重在后端，界面要显示的是去重之后的结果。
+   */
+  addTicketPreference(
+    ticketId: string,
+    preference: string
+  ): Promise<CustomerPreferenceResponse> {
+    return this.post<CustomerPreferenceResponse>(
+      `/tickets/${encodeURIComponent(ticketId)}/preference`,
+      { preference }
     );
   }
 

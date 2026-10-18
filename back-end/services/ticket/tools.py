@@ -32,7 +32,6 @@
 """
 from __future__ import annotations
 
-import json
 import uuid
 from decimal import Decimal
 from typing import Any, Callable
@@ -40,21 +39,29 @@ from typing import Any, Callable
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy.orm import Session
 
-from models import CsCustomer, CsInvoice, CsOperation, CsOrder, CsOrderItem, CsRefund, CsShipment
+from models import CsInvoice, CsOperation, CsOrder, CsRefund
 from services import audit_log
 from services.clock import naive_now
+from services.ticket import business_system
 from services.ticket import governor, ledger
+from services.ticket.business_system import OrderSnapshot, ShipmentSnapshot
 from services.ticket.understand import parse_amount
 from services.tool_runtime import ToolDefinition
+
+# 业务系统的读全部走这一处。名字短是有意的：它在每个查询工具里都要出现，
+# 而"忘了走边界、直接 query 一张 cs_* 表"是这一层最容易悄悄退回去的地方。
+_system = business_system.for_session
 
 READ = "read"
 MUTATE = "mutate"
 FUND = "fund"
 
-# 已经离开"我们还能改"那一段的状态
-_LOCKED_ORDER_STATUSES = frozenset({"shipped", "delivered", "cancelled", "refunded"})
-# 还在途、值得列进"开放订单"的
-_OPEN_ORDER_STATUSES = frozenset({"pending_payment", "paid", "packed", "refunding"})
+# 已经离开"我们还能改"那一段的状态。口径住在 business_system（它同时给导入校验
+# 用），这里只是引用——两张清单各写一份的话，漂移的方式是"导入接受了一个状态而
+# 写路径不认"，症状是数据进得来、动不了。
+_LOCKED_ORDER_STATUSES = business_system.LOCKED_ORDER_STATUSES
+# "在途订单"的口径不在这里了——它跟着读侧搬进了 business_system。
+# 留两份相等清单正是本仓库反复栽的那个形状：一开始相等，后来才漂移。
 
 
 class BusinessReject(Exception):
@@ -239,20 +246,27 @@ def find_order(db: Session, workspace_id: str, order_no: str) -> CsOrder | None:
 
 
 def _must_find_order(db: Session, workspace_id: str, order_no: str) -> CsOrder:
+    """**接缝停在这里。** 只有写路径还用得着它，因为写要改的就是这一行。
+
+    读侧已经全部改走 ``_system(...)`` 拿值对象了（见 business_system 的模块文档串）。
+    写侧留一个 ORM 对象不是偷懒：退款必须和它的账本行在**同一个事务**里落，
+    而那个事务就是这个 session。抽象成"快照进、结果出"之前，先把这条保证用测试
+    钉住（``test_ticket_tools.py`` 里那几条"账本行与业务行同时可见"的断言），
+    否则搬动它的时候症状是退款记了账而订单金额没变——不报错，只是账对不上。
+    """
     order = find_order(db, workspace_id, order_no)
     if order is None:
         raise _no_order(order_no)
     return order
 
 
-def _order_lines(db: Session, order: CsOrder) -> str:
-    items = db.query(CsOrderItem).filter(CsOrderItem.order_id == order.id).all()
-    refundable = order.total_amount - order.refunded_amount
+def _order_lines(order: OrderSnapshot) -> str:
+    refundable = order.refundable
     lines = [
         f"订单 {order.order_no}：状态 {order.status}，实付 {_yuan(order.total_amount)}，"
         f"已退 {_yuan(order.refunded_amount)}，可退 {_yuan(refundable)}"
     ]
-    for item in items:
+    for item in order.lines:
         lines.append(
             f"  - {item.title}（{item.sku}）×{item.quantity}，单价 {_yuan(item.unit_price)}"
             + (f"，行状态 {item.line_status}" if item.line_status else "")
@@ -263,7 +277,7 @@ def _order_lines(db: Session, order: CsOrder) -> str:
     return "\n".join(lines)
 
 
-def _shipment_lines(shipment: CsShipment) -> str:
+def _shipment_lines(shipment: ShipmentSnapshot) -> str:
     return (
         f"  {shipment.carrier} {shipment.tracking_no}：{shipment.status}"
         + (f"，最新：{shipment.last_event}" if shipment.last_event else "")
@@ -271,87 +285,54 @@ def _shipment_lines(shipment: CsShipment) -> str:
 
 
 def lookup_order(db: Session, workspace_id: str, *, order_no: str) -> str:
-    order = _must_find_order(db, workspace_id, order_no)
-    shipments = db.query(CsShipment).filter(CsShipment.order_id == order.id).all()
-    text = _order_lines(db, order)
-    if shipments:
-        text += "\n物流：\n" + "\n".join(_shipment_lines(item) for item in shipments)
+    order = _system(db, workspace_id).get_order(order_no)
+    if order is None:
+        raise _no_order(order_no)
+    text = _order_lines(order)
+    if order.shipments:
+        text += "\n物流：\n" + "\n".join(_shipment_lines(item) for item in order.shipments)
     return text
 
 
 def lookup_logistics(db: Session, workspace_id: str, *, order_no: str = "", tracking_no: str = "") -> str:
+    system = _system(db, workspace_id)
     if tracking_no.strip():
-        shipments = (
-            db.query(CsShipment)
-            .filter(CsShipment.tracking_no == tracking_no.strip())
-            .all()
-        )
+        # 租户隔离写在实现里（见 business_system 的模块文档串）：调用方拿不到
+        # "绕过 join 的裸查询"这个选项。报错也不区分"不存在"和"不是你的"——
+        # 那条边界一旦泄露，就变成"这个运单号确实存在，只是在别人手里"。
+        shipments = system.find_shipments_by_tracking(tracking_no)
         if not shipments:
             raise BusinessReject(f"查无运单：{tracking_no}。请核对客户提供的运单号是否完整。")
         return "物流：\n" + "\n".join(_shipment_lines(item) for item in shipments)
 
-    order = _must_find_order(db, workspace_id, order_no)
-    shipments = db.query(CsShipment).filter(CsShipment.order_id == order.id).all()
-    if not shipments:
+    order = system.get_order(order_no)
+    if order is None:
+        raise _no_order(order_no)
+    if not order.shipments:
         raise BusinessReject(
             f"订单 {order.order_no} 还没有发货记录（当前状态 {order.status}）。"
             "没有发货不等于丢件，先按状态向客户说明，不要承诺时效。"
         )
     return f"订单 {order.order_no} 的物流：\n" + "\n".join(
-        _shipment_lines(item) for item in shipments
-    )
-
-
-def _resolve_customer(
-    db: Session, workspace_id: str, *, customer_id: str = "", email: str = "", phone: str = ""
-) -> CsCustomer | None:
-    query = db.query(CsCustomer).filter(CsCustomer.workspace_id == workspace_id)
-    if customer_id.strip():
-        return query.filter(CsCustomer.id == customer_id.strip()).first()
-    normalized = (email or "").strip().lower()
-    if normalized:
-        return query.filter(CsCustomer.email == normalized).first()
-    digits = "".join(character for character in (phone or "") if character.isdigit())
-    if digits:
-        return query.filter(CsCustomer.phone == digits).first()
-    return None
-
-
-def _open_orders(db: Session, workspace_id: str, customer_id: str) -> list[CsOrder]:
-    return (
-        db.query(CsOrder)
-        .filter(
-            CsOrder.workspace_id == workspace_id,
-            CsOrder.customer_id == customer_id,
-            CsOrder.status.in_(_OPEN_ORDER_STATUSES),
-        )
-        .all()
+        _shipment_lines(item) for item in order.shipments
     )
 
 
 def lookup_customer(db: Session, workspace_id: str, *, customer_id: str = "", email: str = "", phone: str = "") -> str:
-    customer = _resolve_customer(
-        db, workspace_id, customer_id=customer_id, email=email, phone=phone
+    customer = _system(db, workspace_id).find_customer(
+        customer_id=customer_id, email=email, phone=phone
     )
     if customer is None:
         raise BusinessReject(
             "没有找到这个客户。可能是邮箱或号码抄错了——回头向客户确认，"
             "不要凭一个相近的地址替他建档。"
         )
-    flags = ""
-    if customer.risk_flags:
-        try:
-            loaded = json.loads(customer.risk_flags)
-        except (TypeError, ValueError):
-            loaded = None
-        if isinstance(loaded, list) and loaded:
-            flags = f"，风险标记：{'、'.join(str(flag) for flag in loaded)}"
-    orders = _open_orders(db, workspace_id, customer.id)
+    flags = f"，风险标记：{'、'.join(customer.risk_flags)}" if customer.risk_flags else ""
     return (
         f"客户 {customer.display_name or customer.id}（档位 {customer.tier}）"
         f"累计消费 {_yuan(customer.lifetime_amount)}{flags}；"
-        f"在途订单 {len(orders)} 笔："
-        + ("、".join(order.order_no for order in orders) or "无")
+        f"在途订单 {len(customer.open_order_nos)} 笔："
+        + ("、".join(customer.open_order_nos) or "无")
     )
 
 

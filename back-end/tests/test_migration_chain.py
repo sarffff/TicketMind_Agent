@@ -1,9 +1,9 @@
 """迁移链的静态约束。
 
-这个文件测的是**不跑迁移也能查出来的错**。跑不了是因为 SQLite 上整条链从零执行
-不通（``0001_baseline`` 只建一部分表，而 ``users`` 有指向 ``workspaces`` 的外键，
-MySQL 建表时就检查、SQLite 不检查），而项目用的是 MySQL——那条路径由
-``database.init_db`` 的 ``create_all`` + ``stamp`` 走，不是 ``upgrade from zero``。
+这个文件测的是**不跑迁移也能查出来的错**。整条链从零执行这件事在 SQLite 上跑不通
+——现在卡的地方是 ``0003_message_feedback`` 要 ALTER 约束，SQLite 不支持，得走 batch
+mode。项目用的是 MySQL，那条路径由 CI 的 ``schema`` job 真跑一遍（空库 →
+``alembic upgrade head`` → ``check_schema_drift --gate``），不在这里。
 
 所以这里钉的是几条静态性质。它们的共同点是：**在 SQLite 上完全没有症状，
 在 MySQL 上是升级中途失败**——而"中途"意味着前几条已经跑完，库停在一个
@@ -11,6 +11,7 @@ MySQL 建表时就检查、SQLite 不检查），而项目用的是 MySQL——�
 """
 from __future__ import annotations
 
+import ast
 import os
 import re
 
@@ -116,3 +117,42 @@ def test_每条迁移都有downgrade():
             continue
         src = open(os.path.join(MIGRATIONS, name), encoding="utf-8").read()
         assert "def downgrade()" in src, f"{name} 没有 downgrade"
+
+
+def test_基线不跟着models_py漂移():
+    """``0001_baseline`` 不许从 ``Base.metadata`` 取表形状。
+
+    踩过的现场：它原来直接 ``create_all(Base.metadata)``，于是"历史快照"跟着今天的
+    models.py 一起漂——新库里 ``documents`` 一出生就带着 ``content_hash``（那是 0006
+    才该加的列），``alembic upgrade head`` 跑到 0006 撞 ``Duplicate column name``，
+    整条链在空库上从头跑不通。而 README 的手动部署路径写的正是这一条。
+
+    开发期完全看不见这个洞：``init_db`` 走 create_all + stamp，根本不执行迁移。
+    所以这里查的是**结构**（AST 里的 import 与属性访问），不是文本——文档串要能
+    继续说"以前那一版怎么用 ``Base.metadata`` 把部署跑坏的"，那是这段历史唯一的
+    存放处，把它删掉换不来任何安全性。
+    """
+    path = os.path.join(MIGRATIONS, "0001_baseline.py")
+    src = open(path, encoding="utf-8").read()
+    tree = ast.parse(src)
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            offenders += [alias.name for alias in node.names if alias.name == "models"]
+        elif isinstance(node, ast.ImportFrom) and node.module == "database":
+            offenders += [
+                f"from database import {alias.name}"
+                for alias in node.names
+                if alias.name == "Base"
+            ]
+        elif (
+            isinstance(node, ast.Attribute)
+            and node.attr == "metadata"
+            and isinstance(node.value, ast.Name)
+        ):
+            offenders.append(f"{node.value.id}.metadata")
+    assert not offenders, f"基线又去取当前模型的形状了：{offenders}"
+
+    # 6 张表必须逐列写死在这条迁移里
+    assert src.count("sa.Table(") == 6, "基线应当显式定义 6 张表"

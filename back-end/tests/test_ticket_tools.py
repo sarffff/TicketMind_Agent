@@ -113,6 +113,50 @@ def test_查物流可以按运单号(db_real):
     assert "已到北京中转场" in by_tracking
 
 
+def test_别的工作区的运单号查不到(db_real):
+    """``cs_shipments`` 没有 workspace_id 列，归属跟着订单走。
+
+    这条查询原来是 ``filter(tracking_no == ...)`` 一把梭——按"运单号全局唯一"的直觉
+    查，于是任何工作区的 Agent 拿一个别家的运单号就能看到承运商、状态和最新事件。
+    这张表上每一条查询都做了租户隔离，只有这一条漏了，而漏的原因恰好是"运单号本来就
+    是唯一的"这个直觉是对的、语义却不对：唯一的是号码，可读的人不是所有人。
+    """
+    now = naive_now()
+    foreign = CsOrder(
+        id=str(uuid.uuid4()),
+        workspace_id="w-other",
+        customer_id=None,
+        order_no="ORD-Foreign",
+        status="shipped",
+        currency="CNY",
+        total_amount=Decimal("99.00"),
+        refunded_amount=Decimal("0.00"),
+        created_at=now,
+        updated_at=now,
+    )
+    db_real.add(foreign)
+    db_real.flush()
+    db_real.add(
+        CsShipment(
+            id=str(uuid.uuid4()),
+            order_id=foreign.id,
+            carrier="顺丰",
+            tracking_no="SF-FOREIGN-1",
+            status="in_transit",
+            last_event="已到达上海中转场",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db_real.commit()
+
+    with pytest.raises(tools.BusinessReject) as exc:
+        tools.lookup_logistics(db_real, WS, tracking_no="SF-FOREIGN-1")
+    # 报错不能泄露"它存在"，否则就是一条跨租户的探测信道
+    assert "查无运单" in exc.value.message
+    assert "上海" not in exc.value.message
+
+
 def test_查客户带上风险标记与在途订单(db_real):
     now = naive_now()
     db_real.add(

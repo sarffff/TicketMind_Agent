@@ -19,20 +19,34 @@ interface DecisionCardProps {
   onResolved: (result: TicketRunResult) => void;
 }
 
-/** 把 arguments 的 JSON 字符串解析成可逐键展示的条目；坏数据不让整张卡片崩 */
-function readArguments(raw: string): { key: string; value: unknown }[] {
+/**
+ * 把 arguments 的 JSON 字符串解析成可逐键展示的条目；坏数据不让整张卡片崩。
+ *
+ * `editable` 与 `hint` 在这里定下来而不是在渲染处猜：落库参数不是合法 JSON 时
+ * （旧快照、半截写入）只能整条原文展示，**不能给一个编辑框**——那个框改出来的
+ * 键叫 `raw`，而后端只接受修改已有的键（`approval.validate_edit`）。给出去的话
+ * 症状是"按了批准却什么都没执行"，而卡片上看着完全正常。
+ */
+type ArgumentEntry = { key: string; value: unknown; editable: boolean; hint: string | null };
+
+function readArguments(raw: string, tierName: string | undefined): ArgumentEntry[] {
   try {
     const parsed = JSON.parse(raw || "{}");
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       return Object.entries(parsed as Record<string, unknown>).map(([key, value]) => ({
         key,
         value,
+        editable: typeof value === "string",
+        hint:
+          typeof value === "string"
+            ? null
+            : `${tierLabel(tierName)}类参数不可改型`,
       }));
     }
   } catch {
-    /* 落库的参数不是合法 JSON（旧快照）：按原文一条展示 */
+    /* 落库的参数不是合法 JSON：按原文一条展示 */
   }
-  return [{ key: "raw", value: raw }];
+  return [{ key: "raw", value: raw, editable: false, hint: "参数不是结构化 JSON，只能整体批准或拒绝" }];
 }
 
 /**
@@ -63,9 +77,9 @@ export const DecisionCard: React.FC<DecisionCardProps> = ({
     () =>
       pending.calls.map((call: PendingCall) => ({
         call,
-        entries: readArguments(call.arguments),
+        entries: readArguments(call.arguments, tiers[call.name]),
       })),
-    [pending.calls]
+    [pending.calls, tiers]
   );
 
   const decide = async (approved: boolean) => {
@@ -112,8 +126,7 @@ export const DecisionCard: React.FC<DecisionCardProps> = ({
           </div>
 
           <div className="flex flex-col gap-2">
-            {entries.map(({ key, value }) => {
-              const editable = typeof value === "string";
+            {entries.map(({ key, value, editable, hint }) => {
               const current = editable ? (edits[call.id]?.[key] ?? (value as string)) : String(value);
               const changed = editable && edits[call.id]?.[key] !== undefined && edits[call.id]![key] !== value;
               return (
@@ -138,10 +151,8 @@ export const DecisionCard: React.FC<DecisionCardProps> = ({
                   {changed && (
                     <span className="text-[10.5px] text-state-hold shrink-0">已改</span>
                   )}
-                  {!editable && (
-                    <span className="text-[10px] text-ink-faint shrink-0">
-                      {tierLabel(tiers[call.name])}类参数不可改型
-                    </span>
+                  {hint && (
+                    <span className="text-[10px] text-ink-faint shrink-0">{hint}</span>
                   )}
                 </label>
               );

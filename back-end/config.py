@@ -343,9 +343,14 @@ class Settings(BaseSettings):
     # cooldown:撞上 429 且服务端没给 Retry-After 时,退避多少秒再重试。
     # max_retries:撞上 429 后重试几次(含按配额窗口退避)。默认 12 次是给
     #   一分钟配额窗口留下足够余量;retries 是给「重试次数」的兜底。
+    # transport_retries:超时/连接断开这类重试几次。**刻意比 429 那档小得多**——
+    #   429 是"等一会儿就有",超时是"这一条请求本身慢了",12 次 x 8 秒只会在一个
+    #   真死的 provider 上白等 96 秒/次。2 次是"网络抖一下"和"provider 坏了"
+    #   之间那条尽量便宜的分界;再高就该去看 provider 而不是让脚本扛。
     EVAL_LLM_MIN_INTERVAL_SECONDS: float = 0.5
     EVAL_LLM_RATE_LIMIT_COOLDOWN_SECONDS: float = 8.0
     EVAL_LLM_MAX_RATE_RETRIES: int = 12
+    EVAL_LLM_MAX_TRANSPORT_RETRIES: int = 2
 
     # HyDE(Hypothetical Document Embeddings):先让辅助模型编一段假答案,拿它去
     # 检索。反直觉但有效——用户的问题和文档的措辞常常不在同一个语域("报销要几天"
@@ -593,6 +598,36 @@ class Settings(BaseSettings):
     # 的话这个指标永远只能等客户自己上门骂一句时才有一条数据。
     # 没有接任何发送通道时它只是往队列里多放一行，不会真发出什么。
     TICKET_CSAT_INVITE_ENABLED: bool = True
+    # 自动排空待发队列。**默认关**，和仓库里每一样新能力一样：出问题要能用一条配置
+    # 拨回去，而不是回滚部署。
+    #
+    # 关着的时候只有治理台上那个手动按钮会去 drain，于是"办结的回复什么时候发出去"
+    # 取决于有没有人恰好去点一下——队列只会变长。打开它之前请先确认
+    # ``services/ticket/senders.build_sender()`` 真的返回了一个通道，否则这个循环
+    # 每 N 秒醒来一次、发现没有出口、又睡回去，除了日志什么也不改变。
+    TICKET_OUTBOX_AUTODRAIN: bool = False
+    TICKET_OUTBOX_DRAIN_INTERVAL_SECONDS: int = 30
+    TICKET_OUTBOX_DRAIN_BATCH: int = 10
+
+    # ========== 外发通道：SMTP ==========
+    # 空 host = 没有邮件通道，``senders.build_sender()`` 返回 None，行为与今天一致
+    # （队列只增不减，治理台如实说"没有接入任何发送通道"）。
+    #
+    # 只覆盖 ``email`` 这一个工单渠道：``web_chat`` / ``app`` / ``wecom`` 的行不会被
+    # 这一条通道认领出去（见 ``outbox.claim_next`` 的 channels 过滤）。宁可让它们继续
+    # 躺在 pending 里被看见，也不要用邮件通道把它们"发成功"。
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    # 发件地址。留空视为"通道没配好"而不是"用默认值试试"——半套配置会让每一条
+    # 外发都失败，而那时最难查的是"到底是服务商的问题还是我们没配完"。
+    SMTP_FROM: str = ""
+    SMTP_SUBJECT_PREFIX: str = "【客服工单】"
+    # starttls（默认，587）| ssl（465）| none（本机 relay 之类）。
+    # none 会把凭据和正文都明文发出去，所以用得上它的人应当知道自己为什么用得上。
+    SMTP_SECURITY: str = "starttls"
+    SMTP_TIMEOUT_SECONDS: float = 15.0
 
     # ========== 时区 ==========
     # 应用写入 naive DATETIME 列时使用的时区偏移(小时)。必须与数据库服务器的
@@ -713,8 +748,6 @@ class Settings(BaseSettings):
     def utility_model(self) -> str:
         """辅助任务(摘要/改写/重排/记忆抽取)实际使用的模型"""
         return self.LLM_UTILITY_MODEL or self.LLM_MODEL
-
-    @property
 
     @property
     def judge_model(self) -> str:

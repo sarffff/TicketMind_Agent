@@ -30,6 +30,7 @@ from routers import (
 )
 from services import prompt_library
 from services import security_preflight
+from services.console import utf8_output
 from services import skill_library
 from services import subagent
 from services import ingest_clean
@@ -159,6 +160,29 @@ async def health(response: Response):
                 checks["redis"] = "ok"
         except Exception as exc:  # noqa: BLE001 - 软依赖,不影响 ready
             checks["redis"] = f"error: {type(exc).__name__}"
+
+    # 向量后端同样是软依赖,不进状态码：降级到进程内索引时检索照样出结果,把它算成
+    # 不健康就会让 Qdrant 重启十秒导致编排系统把这个实例踢掉。但"配置要 Qdrant 而
+    # 实际停在内存"这件事总得有个地方能问出来——它不报错、不 500,唯一的症状是重启
+    # 后重建索引、多 worker 各一份,而这些都是安静发生的。
+    #
+    # 先 uses_qdrant() 再读降级状态,顺序有意义：降级标记是**有人敲过门才会立起来**的,
+    # 而健康检查就是那个敲门的人。反过来写的话,一个刚重启、还没接过流量的实例会先
+    # 回几轮 "ok",把 Qdrant 已经挂了这件事藏到第一个检索请求之后。
+    # 探测本身受冷却窗口约束（默认 60 秒一次）+ QDRANT_TIMEOUT_SECONDS,不会变成
+    # 每次探针都去重连。
+    vector_store.uses_qdrant()
+    degraded = vector_store.degradation_state()
+    if degraded is not None:
+        checks["vectorStore"] = (
+            f"degraded: {degraded['errorType']}, "
+            f"{degraded['writesDropped']} 条写入未落库, "
+            f"{degraded['retryInSeconds']}s 后重试"
+        )
+    elif (settings.VECTOR_STORE or "memory").strip().lower() == "qdrant":
+        checks["vectorStore"] = "ok"
+    else:
+        checks["vectorStore"] = "memory"
 
     if not ready:
         response.status_code = 503
@@ -370,6 +394,9 @@ async def startup():
     后者在下面的工单行里必须看得见——限额数字没打出来，"当日退款上限其实没配"这种
     配置就会一直活到第一笔超额退款。
     """
+    # 放在最前面：横幅里有带 `⚠` 的警告分支，GBK 控制台上打不出来会抛
+    # UnicodeEncodeError——那等于"配置有问题"反而让服务起不来
+    utf8_output()
     security_preflight.enforce(settings, logger=logger)
     init_db()
     # 提示词模板有问题（占位符对不上、条件段没闭合、默认版本已归档）就在这里
@@ -446,7 +473,60 @@ async def startup():
                 )
             )
         )
+    _start_outbox_drain()
     print(f"Ticket Agent API is running on: http://localhost:{settings.PORT}")
+
+
+def _start_outbox_drain() -> None:
+    """起自动排空循环，并把它的状态打在启动行里。
+
+    这一行必须看得见：队列"有没有人管"直接决定客户收不收得到回话，而它默认是关的。
+    关着的时候 ``deliver`` 全仓库只有一个调用方——治理台上管理员手动点的那一下。
+
+    通道状态和开关状态要**分开**打。只说"on"是不够的：配了循环但没接通道时，
+    那个循环每 30 秒醒来一次什么也不发，而启动日志读起来像这件事已经解决了。
+    """
+    from services.ticket import outbox as ticket_outbox, senders as ticket_senders
+
+    channel = ticket_senders.build_sender()
+    print(f"Outbound channel: {ticket_senders.describe()}")
+
+    if not (settings.TICKET_AGENT_ENABLED and settings.TICKET_OUTBOX_AUTODRAIN):
+        app.state.outbox_drain = None
+        print(
+            "Outbox autodrain: off（待发队列只在有人点治理台那个按钮时才会被排空）"
+        )
+        return
+    if channel is None:
+        # 开关开着却没有通道：循环只会反复空转。仍然起它（接上通道的瞬间就生效），
+        # 但这一行要说清楚现在一条都发不出去。
+        print("  ⚠ Outbox autodrain 开着但没有出口通道 —— 队列不会被发送。")
+
+    app.state.outbox_drain = asyncio.create_task(ticket_outbox.run_autodrain())
+    print(
+        f"Outbox autodrain: on（每 {settings.TICKET_OUTBOX_DRAIN_INTERVAL_SECONDS}s"
+        f" 一批，每批 ≤{settings.TICKET_OUTBOX_DRAIN_BATCH} 条"
+        + (f"，只发 {'、'.join(sorted(channel.channels))}" if channel else "")
+        + "）"
+    )
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """停掉后台循环。
+
+    不停的话它会在事件循环关闭时才被取消，测试里表现为一条 "Task was destroyed but
+    it is pending" ——而那条警告会让人以为是自己新加的哪个测试有问题。
+    """
+    task = getattr(app.state, "outbox_drain", None)
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    app.state.outbox_drain = None
 
 
 def _print_rerank_mode() -> None:

@@ -66,6 +66,40 @@ def test_健康时回200且列出各项检查(client):
     assert body["checks"]["database"] == "ok"
     # Redis 未配置时说 disabled,而不是 error——那是配置选择,不是故障
     assert body["checks"]["redis"] in ("disabled", "ok", "unavailable")
+    # 向量后端必须有名字。它和 Redis 同理是软依赖，但比 Redis 更安静：降级之后
+    # 检索照样出结果，唯一的症状是重启重建、多 worker 各一份，全是无声的。
+    assert body["checks"]["vectorStore"] in ("memory", "ok") or body["checks"][
+        "vectorStore"
+    ].startswith("degraded:")
+
+
+def test_向量降级只报告不影响ready(client, monkeypatch):
+    """Qdrant 挂了不该让这个实例被踢掉。
+
+    反过来也要成立：不踢掉不等于不吭声——降级期间"配置要 Qdrant、实际在内存"这件事
+    必须能从这一格里问出来，否则它就只有一行启动日志，而没人会去翻启动日志。
+    """
+    import main
+    from services import vector_store as vs
+
+    vs.reset_for_tests()
+    monkeypatch.setattr(vs.settings, "VECTOR_STORE", "qdrant")
+    monkeypatch.setattr(
+        vs.QdrantVectorStore,
+        "_get_client",
+        lambda self: (_ for _ in ()).throw(OSError("connection refused")),
+    )
+    try:
+        response = client.get("/health")
+        assert response.status_code == 200, "软依赖不能把 ready 拉下来"
+        assert response.json()["status"] == "ok"
+        report = response.json()["checks"]["vectorStore"]
+        assert report.startswith("degraded:"), report
+        assert "OSError" in report, "报的要足够具体才知道该去查什么"
+        # 异常消息本身（"connection refused"）不出去：这个端点不需要认证
+        assert "connection refused" not in report
+    finally:
+        vs.reset_for_tests()
 
 
 def test_数据库不通时回503(client, monkeypatch):

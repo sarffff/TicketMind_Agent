@@ -48,6 +48,7 @@ from config import settings
 from database import Base
 from models import CsOperation, CsOrder, CsRefund, CsShipment, Ticket
 from services.clock import naive_now
+from services.console import utf8_output
 from services.model_adapter import ModelAdapter, ModelCompletion, StreamChunk, ToolCall
 from services.ticket import governor
 from services.ticket.graph import TicketRuntime, run_ticket
@@ -433,6 +434,9 @@ def _render(results: list[dict[str, Any]], summary: dict[str, Any]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 这份报告里有「·」和「⚠」，而 Windows 上输出被重定向时 stdout 是 GBK——
+    # 报不合格的那一刻炸在编码上，比没有报告更糟（见 services/console.py）
+    utf8_output()
     parser = argparse.ArgumentParser(description="工单护栏评估（离线）")
     parser.add_argument("--limit", type=int, default=None, help="只跑前 N 条")
     parser.add_argument("--dataset", default=DATASET, help="数据集路径（jsonl）")
